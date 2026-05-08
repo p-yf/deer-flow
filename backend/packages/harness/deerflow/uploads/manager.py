@@ -121,46 +121,110 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
     Upload directories may be mounted into local sandboxes. A sandbox process can
     therefore leave a symlink at a future upload filename. Normal ``Path.write_bytes``
     follows that link and can overwrite files outside the uploads directory with
-    gateway privileges. This helper rejects symlink destinations and uses
-    ``O_NOFOLLOW`` where available so the final path component cannot be raced into
-    a symlink between validation and open.
+    gateway privileges. This helper rejects symlink destinations using ``O_NOFOLLOW``
+    on POSIX; on Windows it uses ``os.lstat`` to pre-check and ``os.open`` without
+    ``O_NOFOLLOW`` (Windows lacks this flag), relying on the pre-check to catch
+    existing symlinks and path-traversal validation to prevent escapes.
     """
-    safe_name = normalize_filename(filename)
-    dest = base_dir / safe_name
+    safe_name = normalize_filename(filename)  # 去除路径遍历字符，得到安全的文件名
+    dest = base_dir / safe_name               # 拼接到上传目录，得到完整目标路径
 
     try:
-        st = os.lstat(dest)
+        st = os.lstat(dest)                   # 获取文件属性（不跟随 symlink）
     except FileNotFoundError:
-        st = None
+        st = None                              # 文件不存在，st 为 None，后续直接创建
 
-    if st is not None and not stat.S_ISREG(st.st_mode):
+    if st is not None and not stat.S_ISREG(st.st_mode):  # S_ISREG = 普通文件（regular file）
         raise UnsafeUploadPathError(f"Upload destination is not a regular file: {safe_name}")
 
     validate_path_traversal(dest, base_dir)
 
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise UnsafeUploadPathError("Upload writes require O_NOFOLLOW support")
+    has_nofollow = hasattr(os, "O_NOFOLLOW")
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
+    # ══════════════════════════════════════════════════════════════════
+    # POSIX 分支（Linux / macOS）：利用 O_NOFOLLOW 在 open() 时拒绝 symlink
+    # ══════════════════════════════════════════════════════════════════
+    if has_nofollow:
+        # 构建 open flags：
+        #   O_WRONLY  = 只写模式
+        #   O_CREAT   = 文件不存在则创建
+        #   O_NOFOLLOW = 不跟随符号链接（核心安全 flag！）
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
 
+        # O_NONBLOCK：非阻塞模式 flag（Linux 有，macOS 可能没有，可选添加）
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+
+        try:
+            fd = os.open(dest, flags, 0o600)  # 以 0o600 权限打开文件
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
+                raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
+            raise  # 其他 OSError（如权限不足）直接重新抛出
+
+        try:
+            opened_stat = os.fstat(fd)        # 通过 fd 获取打开后的文件属性
+
+            if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+                raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
+
+            os.ftruncate(fd, 0)
+
+            fh = os.fdopen(fd, "wb")           # fdopen：把 fd 包装为二进制写文件对象
+            fd = -1                             # sentinel：标记 fd 已转移给 fh，不再归我们关闭
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return dest, fh                        # 返回(目标路径, 文件句柄)给调用者
+
+    # ══════════════════════════════════════════════════════════════════
+    # Windows 分支：系统没有 O_NOFOLLOW，改用"双重 lstat 检查 + 事后 fstat 检查"
+    # ══════════════════════════════════════════════════════════════════
+    if st is not None and st.st_nlink > 1:    # 硬链接数量 > 1 → 拒绝
+        raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
+
+    #   O_WRONLY  = 只写
+    #   O_CREAT   = 不存在则创建
+    # 注意：故意不加 O_TRUNC！
+    #   POSIX 分支在 open 之后单独调用 ftruncate()，中间插入 fstat 安全检查。
+    #   Windows 分支也应该如此：open 后先检查，检查通过再 truncate，
+    #   而不是把 truncate 和 open 合并成一步（那样就没机会检查了）。
+    #   Windows 没有 O_NOFOLLOW，但 os.ftruncate() 在 Windows 上同样有效。
+    flags = os.O_WRONLY | os.O_CREAT
+
+    # O_BINARY：Windows 特有，强制二进制模式
+    #   Windows 默认文本模式会做 \n ↔ \r\n 自动转换，破坏二进制文件
+    #   O_BINARY 告诉系统不要做任何换行符转换
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
     try:
-        fd = os.open(dest, flags, 0o600)
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
-            raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
-        raise
+        pre_open_st = os.lstat(dest)
+    except FileNotFoundError:
+        pre_open_st = None
 
+    # 如果文件存在，必须是普通文件（不是 symlink/目录/设备）
+    if pre_open_st is not None and not stat.S_ISREG(pre_open_st.st_mode):
+        raise UnsafeUploadPathError(f"Upload destination is not a regular file: {safe_name}")
+    # 硬链接数量 > 1 → 拒绝（truncate 会影响其他文件名）
+    if pre_open_st is not None and pre_open_st.st_nlink > 1:
+        raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
+
+    fd = os.open(dest, flags, 0o600)           # 以 0o600 权限打开/创建文件
+
+    # 这就是用户建议的"先打开、再检查、再清空"流程！
+    # 关键：os.ftruncate() 在 Windows 上同样有效，可以单独调用，不需要 O_TRUNC flag。
+    # 这样检查（fstat）和清空（ftruncate）分开两步，中间可以安全地拒绝问题文件。
     try:
-        opened_stat = os.fstat(fd)
-        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+        opened_stat = os.fstat(fd)            # 通过 fd 获取打开后的真实 inode 属性
+        # 检查①：必须是普通文件
+        # 检查②：硬链接数 ≤ 1（open 后的 fstat 是 TOCTOU 的最后防线）
+        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink > 1:
             raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
-        os.ftruncate(fd, 0)
-        fh = os.fdopen(fd, "wb")
-        fd = -1
+        os.ftruncate(fd, 0)                  # 检查通过后，才清空文件内容（与 POSIX 完全一致）
+        fh = os.fdopen(fd, "wb")             # fd → 二进制写文件对象
+        fd = -1                               # sentinel：fd 已转移给 fh
     finally:
-        if fd >= 0:
+        if fd >= 0:                           # 异常时保证 fd 不泄漏
             os.close(fd)
     return dest, fh
 
