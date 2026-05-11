@@ -42,10 +42,15 @@ class MemoryUpdateQueue:
     def add(
         self,
         thread_id: str,
+        # 线程ID，标识这个对话属于哪个会话
         messages: list[Any],
+        # messages：对话消息列表，包含用户输入和AI回复
         agent_name: str | None = None,
+        # agent_name：可选，如果提供则记忆按agent分别存储
         correction_detected: bool = False,
+        # correction_detected：用户是否纠正了AI的输出（True表示检测到修正信号）
         reinforcement_detected: bool = False,
+        # reinforcement_detected：用户是否肯定了AI的输出（True表示检测到正向强化信号）
     ) -> None:
         """Add a conversation to the update queue.
 
@@ -57,33 +62,80 @@ class MemoryUpdateQueue:
             reinforcement_detected: Whether recent turns include a positive reinforcement signal.
         """
         config = get_memory_config()
+        # 从配置文件获取memory配置，检查功能是否启用
+
         if not config.enabled:
+            # 如果memory功能被禁用（config.enabled = False）
             return
+            # 直接返回，不做任何处理
 
         with self._lock:
+            # 获取线程锁，确保多线程环境下安全操作
+            # 所有后续的队列操作都在锁保护下进行
+
+            # 查找队列中是否已存在该thread_id的待处理上下文
+            # 使用next()遍历队列，找到第一个thread_id匹配的context
             existing_context = next(
                 (context for context in self._queue if context.thread_id == thread_id),
+                # 生成器表达式：遍历_queue中所有context，匹配thread_id
                 None,
+                # 如果找不到匹配的，返回None作为默认值
             )
-            merged_correction_detected = correction_detected or (existing_context.correction_detected if existing_context is not None else False)
-            merged_reinforcement_detected = reinforcement_detected or (existing_context.reinforcement_detected if existing_context is not None else False)
+
+            # 合并correction_detected信号
+            # 逻辑：如果当前调用检测到True，或者之前已存在且也检测到True，则为True
+            # 这是为了不丢失之前检测到的修正信号
+            merged_correction_detected = correction_detected or (
+                existing_context.correction_detected
+                if existing_context is not None
+                else False
+            )
+
+            # 合并reinforcement_detected信号，与correction同理
+            merged_reinforcement_detected = reinforcement_detected or (
+                existing_context.reinforcement_detected
+                if existing_context is not None
+                else False
+            )
+
+            # 创建新的ConversationContext对象
             context = ConversationContext(
                 thread_id=thread_id,
+                # 线程ID
+
                 messages=messages,
+                # 消息列表（更新为最新的对话内容）
+
                 agent_name=agent_name,
+                # Agent名称
+
                 correction_detected=merged_correction_detected,
+                # 合并后的修正标志（可能包含之前的历史信号）
+
                 reinforcement_detected=merged_reinforcement_detected,
+                # 合并后的强化标志（可能包含之前的历史信号）
             )
 
-            # Check if this thread already has a pending update
-            # If so, replace it with the newer one
+            # 从队列中移除该thread_id的旧上下文（如果存在）
+            # 过滤掉所有thread_id等于当前thread_id的元素（即删除旧的）
+            # 为什么要这样做：同一thread_id只保留最新的一次add，避免重复处理
             self._queue = [c for c in self._queue if c.thread_id != thread_id]
+
+            # 将新创建的context添加到队列末尾
             self._queue.append(context)
 
-            # Reset or start the debounce timer
+            # 重置防抖定时器
+            # 如果之前有定时器存在，会被取消
+            # 然后启动一个新的定时器，在debounce_seconds后触发_process_queue
+            # 关键效果：如果短时间内多次调用add()，只有最后一次会触发实际处理
             self._reset_timer()
 
-        logger.info("Memory update queued for thread %s, queue size: %d", thread_id, len(self._queue))
+        logger.info(
+            "Memory update queued for thread %s, queue size: %d",
+            thread_id,
+            len(self._queue)
+        )
+        # 记录日志：线程ID和当前队列中的待处理项数量
 
     def _reset_timer(self) -> None:
         """Reset the debounce timer."""

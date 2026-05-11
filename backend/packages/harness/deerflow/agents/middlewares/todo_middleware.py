@@ -1,49 +1,134 @@
-"""Middleware that extends TodoListMiddleware with context-loss detection.
+"""TodoMiddleware - TodoList 上下文丢失检测中间件。
 
-When the message history is truncated (e.g., by SummarizationMiddleware), the
-original `write_todos` tool call and its ToolMessage can be scrolled out of the
-active context window. This middleware detects that situation and injects a
-reminder message so the model still knows about the outstanding todo list.
+功能概述：
+  扩展 LangChain 的 TodoListMiddleware，检测 write_todos 上下文丢失并注入提醒。
+
+问题背景：
+  当消息历史被截断（如 SummarizationMiddleware  summarization 后），
+  原始的 write_todos 工具调用和其 ToolMessage 可能从活跃上下文窗口中滚出，
+  导致模型忘记当前的待办列表状态。
+
+解决方案：
+  在 before_model 钩子中检测这种情况，并注入一条提醒消息：
+
+触发条件（全部满足才注入）：
+  - state.todos 非空
+  - 消息历史中没有 write_todos 调用
+  - 消息历史中没有已存在的 todo_reminder 提醒
+
+提醒消息格式：
+  - 使用 <system_reminder> 标签包裹
+  - 包含当前待办列表的完整状态
+  - 提示模型继续跟踪和更新待办列表
+
+执行位置：紧接 SummarizationMiddleware 之后（当 is_plan_mode 时才添加）。
 """
 
+# 从 __future__ 导入 annotations，使类型注解可以引用尚未定义的类（向前引用）
 from __future__ import annotations
 
+# typing 导入 Any（任意类型）和 override（方法重写标记）
 from typing import Any, override
 
+# langchain.agents.middleware：导入 TodoListMiddleware（被继承的基础中间件）
 from langchain.agents.middleware import TodoListMiddleware
+# langchain.agents.middleware.todo：导入 PlanningState（规划状态）和 Todo（待办项类型）
 from langchain.agents.middleware.todo import PlanningState, Todo
+# langchain_core.messages：导入 AIMessage（检查是否有 write_todos 调用）
+# 和 HumanMessage（用于注入提醒消息）
 from langchain_core.messages import AIMessage, HumanMessage
+# langgraph.runtime：导入 Runtime，LangGraph 运行时上下文
 from langgraph.runtime import Runtime
 
 
+# 模块级函数：检查消息列表中是否存在 write_todos 工具调用
+#
+# 参数：
+#   messages: list[Any]，消息列表
+#
+# 返回值：
+#   bool：如果任何 AIMessage 包含 write_todos 工具调用则返回 True
+#
+# 工作原理：
+#   遍历所有消息，找到所有 AIMessage，检查其 tool_calls 中是否有 write_todos
 def _todos_in_messages(messages: list[Any]) -> bool:
     """Return True if any AIMessage in *messages* contains a write_todos tool call."""
+    # 遍历所有消息
     for msg in messages:
+        # 只检查 AIMessage 且有 tool_calls 的消息
         if isinstance(msg, AIMessage) and msg.tool_calls:
+            # 检查每个 tool_call
             for tc in msg.tool_calls:
                 if tc.get("name") == "write_todos":
-                    return True
+                    return True  # 找到了 write_todos 调用
+    # 没有找到任何 write_todos 调用
     return False
 
 
+# 模块级函数：检查消息列表中是否已经存在 todo_reminder 提醒消息
+#
+# 参数：
+#   messages: list[Any]，消息列表
+#
+# 返回值：
+#   bool：如果已经存在 todo_reminder 人类消息则返回 True
+#
+# 工作原理：
+#   遍历所有消息，找到所有 HumanMessage，检查其 name 属性是否为 "todo_reminder"
 def _reminder_in_messages(messages: list[Any]) -> bool:
     """Return True if a todo_reminder HumanMessage is already present in *messages*."""
+    # 遍历所有消息
     for msg in messages:
+        # 只检查 HumanMessage 且有 name 属性的消息
         if isinstance(msg, HumanMessage) and getattr(msg, "name", None) == "todo_reminder":
-            return True
+            return True  # 已经存在提醒消息
+    # 没有找到提醒消息
     return False
 
 
+# 模块级函数：将 Todo 项列表格式化为可读字符串
+#
+# 参数：
+#   todos: list[Todo]，待办项列表
+#
+# 返回值：
+#   str：格式化的待办列表字符串
+#
+# 格式示例：
+#   - [in_progress] 完成任务 A
+#   - [pending] 完成任务 B
 def _format_todos(todos: list[Todo]) -> str:
     """Format a list of Todo items into a human-readable string."""
-    lines: list[str] = []
+    lines: list[str] = []  # 存储格式化后的每一行
+    # 遍历每个待办项
     for todo in todos:
+        # 获取状态和内容
         status = todo.get("status", "pending")
         content = todo.get("content", "")
+        # 格式化为 "- [status] content" 格式
         lines.append(f"- [{status}] {content}")
+    # 用换行符连接所有行
     return "\n".join(lines)
 
 
+# TodoMiddleware 类：待办列表中间件（扩展版本）
+#
+# 工作原理：
+#   1. 继承自 TodoListMiddleware（LangChain 提供的标准待办列表中间件）
+#   2. 在 before_model 钩子中检测 write_todos 上下文丢失
+#   3. 如果待办列表存在于状态中，但原始 write_todos 调用已不在消息历史中
+#   4. 注入一条 HumanMessage 提醒，让模型继续跟踪待办进度
+#
+# 触发条件：
+#   - state.todos 非空
+#   - 消息历史中没有 write_todos 调用
+#   - 消息历史中没有已存在的 todo_reminder 提醒
+#
+# 设计考虑：
+#   当 SummarizationMiddleware 截断消息历史时，原始的 write_todos 调用
+#   可能被移除，导致模型忘记当前有哪些待办事项。这个中间件通过注入
+#   提醒消息来解决这个问题，让模型即使在上下文窗口缩小的情况下也能
+#   继续正确跟踪待办列表状态。
 class TodoMiddleware(TodoListMiddleware):
     """Extends TodoListMiddleware with `write_todos` context-loss detection.
 
@@ -53,6 +138,22 @@ class TodoMiddleware(TodoListMiddleware):
     and injects a reminder message so the model can continue tracking progress.
     """
 
+    # before_model：同步版本的模型调用前钩子
+    #
+    # 工作流程：
+    #   1. 获取待办列表（todos）
+    #   2. 如果为空，不需要提醒
+    #   3. 检查消息历史中是否还有 write_todos 调用
+    #   4. 如果有，说明上下文完整，不需要提醒
+    #   5. 检查是否已经注入过提醒消息
+    #   6. 如果都没有，注入新的提醒消息
+    #
+    # 参数：
+    #   state: PlanningState，当前规划状态
+    #   runtime: Runtime，运行时上下文（未使用，但接口需要）
+    #
+    # 返回值：
+    #   dict[str, Any] | None：状态更新（包含提醒消息），如果不需要则返回 None
     @override
     def before_model(
         self,
@@ -60,24 +161,30 @@ class TodoMiddleware(TodoListMiddleware):
         runtime: Runtime,  # noqa: ARG002
     ) -> dict[str, Any] | None:
         """Inject a todo-list reminder when write_todos has left the context window."""
+        # 从状态中获取待办列表
         todos: list[Todo] = state.get("todos") or []  # type: ignore[assignment]
+        # 如果没有待办事项，不需要提醒
         if not todos:
             return None
 
+        # 获取消息列表
         messages = state.get("messages") or []
+        # 检查消息历史中是否还有 write_todos 调用
         if _todos_in_messages(messages):
-            # write_todos is still visible in context — nothing to do.
+            # write_todos 仍然在上下文中可见 — 不需要做任何事
             return None
 
+        # 检查是否已经注入了提醒消息
         if _reminder_in_messages(messages):
-            # A reminder was already injected and hasn't been truncated yet.
+            # 提醒已经被注入且还没有被截断
             return None
 
-        # The todo list exists in state but the original write_todos call is gone.
-        # Inject a reminder as a HumanMessage so the model stays aware.
-        formatted = _format_todos(todos)
+        # 待办列表存在于状态中，但原始 write_todos 调用已经消失
+        # 注入一条提醒消息，让模型保持对待办列表的认知
+        formatted = _format_todos(todos)  # 格式化待办列表
+        # 创建提醒消息（使用 <system_reminder> 标签包裹内容）
         reminder = HumanMessage(
-            name="todo_reminder",
+            name="todo_reminder",  # 标记消息名称，用于去重检查
             content=(
                 "<system_reminder>\n"
                 "Your todo list from earlier is no longer visible in the current context window, "
@@ -88,8 +195,12 @@ class TodoMiddleware(TodoListMiddleware):
                 "</system_reminder>"
             ),
         )
+        # 返回状态更新，包含新消息
         return {"messages": [reminder]}
 
+    # abefore_model：异步版本的模型调用前钩子
+    #
+    # 功能与同步版本相同，直接委托给 before_model
     @override
     async def abefore_model(
         self,
