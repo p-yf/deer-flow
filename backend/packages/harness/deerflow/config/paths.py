@@ -286,14 +286,52 @@ class Paths:
 _paths: Paths | None = None
 
 
+# get_paths：获取全局路径配置单例
+#
+# 作用说明：
+#   返回全局的 Paths 单例实例，采用懒加载模式。
+#   首次调用时创建 Paths 实例，后续调用直接返回缓存实例。
+#
+# 返回值：
+#   Paths：全局路径配置实例
+#
+# 调用位置：
+#   UploadsMiddleware 调用此函数获取上传目录路径
+#   来源文件：deerflow/agents/middlewares/uploads_middleware.py
+#
+# 设计考虑：
+#   - 单例模式确保所有组件使用相同的路径配置
+#   - 懒加载避免启动时不必要的开销
+#   - 线程安全（Python GIL 保护）
 def get_paths() -> Paths:
     """Return the global Paths singleton (lazy-initialized)."""
     global _paths
+    # 检查是否已创建实例（懒加载）
     if _paths is None:
+        # 创建新的 Paths 实例
         _paths = Paths()
     return _paths
 
 
+# resolve_path：解析路径为绝对路径
+#
+# 作用说明：
+#   将给定的路径字符串解析为绝对 Path 对象。
+#   相对路径基于应用基础目录解析，绝对路径直接返回。
+#
+# 参数：
+#   - path：路径字符串
+#
+# 返回值：
+#   解析后的绝对 Path 对象
+#
+# 调用位置：
+#   用于沙箱工具中解析文件路径
+#   来源文件：deerflow/sandbox/tools.py
+#
+# 设计考虑：
+#   - 相对路径总是基于 base_dir 解析，确保一致性
+#   - 调用 .resolve() 解析符号链接并获取规范路径
 def resolve_path(path: str) -> Path:
     """Resolve *path* to an absolute ``Path``.
 
@@ -301,6 +339,8 @@ def resolve_path(path: str) -> Path:
     Absolute paths are returned as-is (after normalisation).
     """
     p = Path(path)
+    # 如果是相对路径，基于应用基础目录解析
     if not p.is_absolute():
         p = get_paths().base_dir / path
+    # 解析符号链接并返回规范路径
     return p.resolve()

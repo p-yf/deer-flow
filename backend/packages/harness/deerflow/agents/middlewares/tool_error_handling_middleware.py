@@ -23,40 +23,78 @@
 """
 """Tool error handling middleware and shared runtime middleware builders."""
 
-# 导入标准库 logging，用于记录日志
+# ============================================================
+# 导入标准库
+# ============================================================
+
+# logging：标准库日志模块，用于记录中间件运行日志
 import logging
-# collections.abc 导入 Awaitable（异步可调用）和 Callable（可调用对象）
+
+# collections.abc 导入：
+#   - Awaitable：异步可等待对象类型，用于异步 handler 的返回类型注解
+#   - Callable：可调用对象类型，用于 handler 参数的类型注解
 from collections.abc import Awaitable, Callable
-# typing 导入 override（方法重写标记）
+
+# typing 导入：
+#   - override：方法重写标记，用于明确表示重写父类方法
 from typing import override
 
-# 从 langchain.agents 导入 AgentState（agent 基础状态类）
+# ============================================================
+# 导入 LangChain / LangGraph 相关模块
+# ============================================================
+
+# langchain.agents.AgentState：
+#   LangChain agent 的基础状态类，所有自定义状态类继承自此
 from langchain.agents import AgentState
-# 从 langchain.agents.middleware 导入 AgentMiddleware（中间件基类）
+
+# langchain.agents.middleware.AgentMiddleware：
+#   LangChain 的中间件基类，所有自定义中间件必须继承此类
 from langchain.agents.middleware import AgentMiddleware
-# 从 langchain_core.messages 导入 ToolMessage（工具消息）
-# 当工具执行失败时，需要返回一个包含错误信息的 ToolMessage
+
+# langchain_core.messages.ToolMessage：
+#   工具消息类型，当工具执行失败时返回此类型的消息
+#   包含错误信息供 LLM 理解工具调用失败的原因
 from langchain_core.messages import ToolMessage
-# 从 langgraph.errors 导入 GraphBubbleUp
-# 这是 LangGraph 的控制流信号（如 interrupt、pause、resume）
-# 这些信号需要被保留而不是被转换成错误消息
+
+# langgraph.errors.GraphBubbleUp：
+#   LangGraph 的控制流信号（如 interrupt、pause、resume）
+#   这些信号需要被保留而不是被转换成错误消息
 from langgraph.errors import GraphBubbleUp
-# 从 langgraph.prebuilt.tool_node 导入 ToolCallRequest
-# 这是工具调用的请求对象，包含 tool_call（工具调用信息）
+
+# langgraph.prebuilt.tool_node.ToolCallRequest：
+#   工具调用的请求对象，包含 tool_call（工具名称、参数、ID 等）
 from langgraph.prebuilt.tool_node import ToolCallRequest
-# 从 langgraph.types 导入 Command
-# 这是 LangGraph 的命令类型，用于控制图执行流程（如中断、跳转）
+
+# langgraph.types.Command：
+#   LangGraph 的命令类型，用于控制图执行流程（如中断、跳转）
 from langgraph.types import Command
+
+# ============================================================
+# 模块级变量初始化
+# ============================================================
 
 # 创建模块级 logger，用于记录中间件运行日志
 logger = logging.getLogger(__name__)
 
-# 模块级常量：当工具调用没有 ID 时使用的默认值
+# ============================================================
+# 模块级常量定义
+# ============================================================
+
+# _MISSING_TOOL_CALL_ID：当工具调用没有 ID 时使用的默认值
 # 这发生在工具调用的 id 字段缺失时
+# 用于确保 ToolMessage 有正确的 tool_call_id
 _MISSING_TOOL_CALL_ID = "missing_tool_call_id"
 
 
-# ToolErrorHandlingMiddleware 类：处理工具执行中的异常
+# ============================================================
+# ToolErrorHandlingMiddleware 主类
+# ============================================================
+
+# ToolErrorHandlingMiddleware 类：工具错误处理中间件
+#
+# 核心作用：
+#   拦截工具调用，捕获执行过程中的异常，
+#   将异常转换为格式良好的错误 ToolMessage，让 agent 可以优雅地继续执行。
 #
 # 工作原理：
 #   1. 拦截工具调用（wrap_tool_call / awrap_tool_call）
@@ -64,7 +102,6 @@ _MISSING_TOOL_CALL_ID = "missing_tool_call_id"
 #   3. 如果执行成功，返回正常结果
 #   4. 如果抛出 GraphBubbleUp（LangGraph 控制流信号），重新抛出
 #   5. 如果是其他异常，将异常转换为包含错误信息的 ToolMessage
-#      这样 agent 可以继续执行（用错误信息作为上下文选择其他工具）
 #
 # 关键设计：
 #   - 不直接让异常传播，而是转换成 ToolMessage
@@ -73,57 +110,78 @@ _MISSING_TOOL_CALL_ID = "missing_tool_call_id"
 class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     """Convert tool exceptions into error ToolMessages so the run can continue."""
 
-    # 内部方法：构建错误 ToolMessage
+    # state_schema：类变量，指定该中间件使用的状态类型
+    state_schema = AgentState
+
+    # ============================================================
+    # 内部辅助方法
+    # ============================================================
+
+    # _build_error_message：构建错误 ToolMessage
+    #
+    # 方法作用：
+    #   将异常对象转换为一个格式良好的错误 ToolMessage。
     #
     # 参数：
     #   request: ToolCallRequest，工具调用请求
-    #   exc: 捕获的异常对象
+    #   exc: Exception，捕获的异常对象
     #
     # 返回值：
-    #   一个 ToolMessage，包含格式化后的错误信息
+    #   ToolMessage，包含格式化后的错误信息
     #
     # 错误消息格式：
-    #   "Error: Tool '{tool_name}' failed with {exception_class}: {detail}. Continue with available context, or choose an alternative tool."
+    #   "Error: Tool '{tool_name}' failed with {exception_class}: {detail}. Continue..."
     #
     # 设计考虑：
-    #   - 错误消息被截断到 500 字符（保留前 497 + "..."）以避免上下文溢出
+    #   - 错误消息被截断到 500 字符以避免上下文溢出
     #   - 消息指示 agent 可以继续使用可用上下文或选择其他工具
     def _build_error_message(self, request: ToolCallRequest, exc: Exception) -> ToolMessage:
         # 获取工具名称，如果不存在则使用 "unknown_tool"
         tool_name = str(request.tool_call.get("name") or "unknown_tool")
+
         # 获取工具调用 ID，如果不存在则使用默认值
         tool_call_id = str(request.tool_call.get("id") or _MISSING_TOOL_CALL_ID)
+
         # 获取异常详情字符串，去除首尾空白
         # 如果异常没有详情（空字符串），使用异常类名作为后备
         detail = str(exc).strip() or exc.__class__.__name__
+
         # 如果详情超过 500 字符，截断到 497 字符并添加 "..."
+        # 避免错误消息占用过多上下文空间
         if len(detail) > 500:
             detail = detail[:497] + "..."
 
         # 构建错误消息内容
         # 格式：Error: Tool '{tool_name}' failed with {exception_class}: {detail}. Continue...
         content = f"Error: Tool '{tool_name}' failed with {exc.__class__.__name__}: {detail}. Continue with available context, or choose an alternative tool."
+
         # 返回包含错误信息的 ToolMessage
         return ToolMessage(
-            content=content,  # 错误消息内容
+            content=content,        # 错误消息内容
             tool_call_id=tool_call_id,  # 工具调用 ID，与请求对应
-            name=tool_name,  # 工具名称
-            status="error",  # 状态设为 "error"，标识这是一个错误响应
+            name=tool_name,          # 工具名称
+            status="error",         # 状态设为 "error"，标识这是一个错误响应
         )
 
-    # wrap_tool_call 钩子方法：同步版本的工具调用包装
+    # ============================================================
+    # LangChain AgentMiddleware 钩子方法
+    # ============================================================
+
+    # wrap_tool_call：同步版本的工具调用包装钩子
     #
-    # 这个方法在工具调用执行前后进行拦截和处理
+    # 方法作用：
+    #   LangChain AgentMiddleware 提供的扩展点，
+    #   在工具调用执行前后进行拦截和处理。
     #
     # 参数：
-    #   request: ToolCallRequest，工具调用请求（包含工具名称、参数等）
-    #   handler: 原始的工具执行处理器（同步函数）
+    #   request: ToolCallRequest，工具调用请求（包含工具名称、参数、ID 等）
+    #   handler: Callable[[ToolCallRequest], ToolMessage | Command]，原始工具执行处理器
     #
     # 返回值：
-    #   ToolMessage | Command
-    #   - 成功：返回原始执行结果（ToolMessage）
-    #   - 控制流信号：重新抛出 GraphBubbleUp
-    #   - 执行失败：返回包含错误信息的 ToolMessage
+    #   ToolMessage | Command：
+    #     - 成功：返回原始执行结果
+    #     - 控制流信号：重新抛出 GraphBubbleUp
+    #     - 执行失败：返回包含错误信息的 ToolMessage
     @override
     def wrap_tool_call(
         self,
@@ -133,27 +191,30 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         try:
             # 调用原始 handler 执行工具
             return handler(request)
+
         except GraphBubbleUp:
             # GraphBubbleUp 是 LangGraph 的控制流信号
             # 包括 interrupt（中断）、pause（暂停）、resume（恢复）等
             # 这些信号必须被保留，不能转换成错误消息
-            # 直接重新抛出
             raise
+
         except Exception as exc:
             # 其他异常（工具执行失败）
             # 记录异常日志（包含工具名称和 ID）
             logger.exception("Tool execution failed (sync): name=%s id=%s", request.tool_call.get("name"), request.tool_call.get("id"))
+
             # 将异常转换为错误 ToolMessage 并返回
             # 这样 agent 可以继续执行，用错误信息作为上下文
             return self._build_error_message(request, exc)
 
-    # awrap_tool_call 钩子方法：异步版本的工具调用包装
+    # awrap_tool_call：异步版本的工具调用包装钩子
     #
-    # 功能与 wrap_tool_call 相同，但支持异步工具执行
+    # 方法作用：
+    #   与 wrap_tool_call 相同，但支持异步 handler。
     #
     # 参数：
     #   request: ToolCallRequest，工具调用请求
-    #   handler: 异步的工具执行处理器（返回 Awaitable）
+    #   handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]]，异步工具执行处理器
     #
     # 返回值：
     #   ToolMessage | Command（与同步版本相同）
@@ -166,29 +227,47 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         try:
             # 使用 await 调用异步 handler
             return await handler(request)
+
         except GraphBubbleUp:
             # 控制流信号，重新抛出
             raise
+
         except Exception as exc:
             # 其他异常
             # 记录异常日志（工具名称和 ID）
             logger.exception("Tool execution failed (async): name=%s id=%s", request.tool_call.get("name"), request.tool_call.get("id"))
+
             # 将异常转换为错误 ToolMessage
             return self._build_error_message(request, exc)
 
 
-# 模块级函数：构建共享的基础运行时中间件列表
+# ============================================================
+# 模块级中间件构建器函数
+# ============================================================
+
+# _build_runtime_middlewares：构建共享的基础运行时中间件列表
 #
-# 这个函数是中间件链的构建器，根据配置决定包含哪些中间件
-# 所有 agent（lead agent 和 subagent）共享的基础中间件都在这里构建
+# 方法作用：
+#   根据配置决定包含哪些中间件，返回按执行顺序排列的中间件列表。
+#   所有 agent（lead agent 和 subagent）共享的基础中间件都在这里构建。
 #
 # 参数：
-#   include_uploads: 是否包含 UploadsMiddleware（注入上传文件信息）
-#   include_dangling_tool_call_patch: 是否包含 DanglingToolCallMiddleware（修复悬空工具调用）
-#   lazy_init: 是否延迟初始化（影响 ThreadDataMiddleware 和 SandboxMiddleware）
+#   include_uploads: bool，是否包含 UploadsMiddleware（注入上传文件信息）
+#   include_dangling_tool_call_patch: bool，是否包含 DanglingToolCallMiddleware（修复悬空工具调用）
+#   lazy_init: bool，是否延迟初始化（影响 ThreadDataMiddleware 和 SandboxMiddleware）
 #
 # 返回值：
-#   中间件列表，按执行顺序排列
+#   list[AgentMiddleware]：中间件列表，按执行顺序排列
+#
+# 中间件顺序：
+#   1. ThreadDataMiddleware - 创建线程数据目录
+#   2. UploadsMiddleware - 注入上传文件信息（可选）
+#   3. SandboxMiddleware - 获取沙箱环境
+#   4. DanglingToolCallMiddleware - 修复悬空工具调用（可选）
+#   5. LLMErrorHandlingMiddleware - 处理 LLM 调用错误
+#   6. GuardrailMiddleware - 工具调用授权检查（可选）
+#   7. SandboxAuditMiddleware - Bash 命令安全审计
+#   8. ToolErrorHandlingMiddleware - 工具错误处理
 def _build_runtime_middlewares(
     *,
     include_uploads: bool,
@@ -214,10 +293,10 @@ def _build_runtime_middlewares(
 
     # 如果配置了 include_uploads，在第二个位置插入 UploadsMiddleware
     # UploadsMiddleware 负责将上传文件信息注入到 agent 上下文
-    # 注意：插入位置是索引 1，所以是在 ThreadDataMiddleware 之后、SandboxMiddleware 之后
     if include_uploads:
         from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
         # insert(1, ...) 将 UploadsMiddleware 插入到列表开头之后的位置
+        # 这样它就在 ThreadDataMiddleware 之后、SandboxMiddleware 之前
         middlewares.insert(1, UploadsMiddleware())
 
     # 如果配置了 include_dangling_tool_call_patch，追加 DanglingToolCallMiddleware
@@ -232,13 +311,12 @@ def _build_runtime_middlewares(
 
     # Guardrail 中间件（如果配置了的话）
     # Guardrail 用于在工具调用前进行授权检查
-    # 从配置中获取 guardrails 配置
     from deerflow.config.guardrails_config import get_guardrails_config
     guardrails_config = get_guardrails_config()
+
     # 如果 guardrails 启用且配置了 provider
     if guardrails_config.enabled and guardrails_config.provider:
         import inspect
-        # 导入 GuardrailMiddleware 和 resolve_variable
         from deerflow.guardrails.middleware import GuardrailMiddleware
         from deerflow.reflection import resolve_variable
 
@@ -250,7 +328,6 @@ def _build_runtime_middlewares(
 
         # 如果 provider 的构造函数接受 framework 参数或 **kwargs
         # 则注入 framework="deerflow" 提示
-        # 内置的 AllowlistProvider 不需要这个参数，所以只检查签名
         if "framework" not in provider_kwargs:
             try:
                 # 检查构造函数的签名
@@ -283,16 +360,17 @@ def _build_runtime_middlewares(
     return middlewares
 
 
-# 函数：构建 Lead Agent 专用的运行时中间件
+# build_lead_runtime_middlewares：构建 Lead Agent 专用的运行时中间件
 #
-# Lead Agent（主代理）使用的中间件链构建函数
-# 它调用 _build_runtime_middlewares 并指定 Lead Agent 的配置
+# 方法作用：
+#   Lead Agent（主代理）使用的中间件链构建函数。
+#   它调用 _build_runtime_middlewares 并指定 Lead Agent 的配置。
 #
 # 参数：
-#   lazy_init: 是否延迟初始化
+#   lazy_init: bool，是否延迟初始化
 #
 # 返回值：
-#   中间件列表
+#   list[AgentMiddleware]：中间件列表
 #
 # Lead Agent 的配置：
 #   - include_uploads=True：需要注入上传文件信息
@@ -306,16 +384,17 @@ def build_lead_runtime_middlewares(*, lazy_init: bool = True) -> list[AgentMiddl
     )
 
 
-# 函数：构建 Subagent（子代理）专用的运行时中间件
+# build_subagent_runtime_middlewares：构建 Subagent 专用的运行时中间件
 #
-# Subagent 使用的中间件链构建函数
-# 子代理与主代理的中间件链略有不同
+# 方法作用：
+#   Subagent 使用的中间件链构建函数。
+#   子代理与主代理的中间件链略有不同。
 #
 # 参数：
-#   lazy_init: 是否延迟初始化
+#   lazy_init: bool，是否延迟初始化
 #
 # 返回值：
-#   中间件列表
+#   list[AgentMiddleware]：中间件列表
 #
 # Subagent 的配置：
 #   - include_uploads=False：子代理不需要处理上传文件

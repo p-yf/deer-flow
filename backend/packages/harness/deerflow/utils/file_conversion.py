@@ -223,6 +223,35 @@ def _clean_bold_title(raw: str) -> str:
     return merged
 
 
+# extract_outline：从 Markdown 文件提取文档大纲
+#
+# 作用说明：
+#   解析 Markdown 文件，提取所有标题作为文档大纲。
+#   支持 pymupdf4llm 转换器产生的三种标题格式。
+#
+# 参数：
+#   - md_path：Markdown 文件路径
+#
+# 返回值：
+#   包含字典的列表，每个字典包含：
+#   - title：标题文本（str）
+#   - line：行号（int，1-based）
+#   当达到 MAX_OUTLINE_ENTRIES 限制时，最后一个元素为 {"truncated": True}
+#   如果文件无法读取或没有标题，返回空列表
+#
+# 支持的三种标题格式：
+#   1. 标准 Markdown 标题：以 # 开头的行
+#   2. 粗体 SEC 结构标题：如 **ITEM 1. BUSINESS**、**PART II**
+#   3. 分割粗体标题：如 **1** **Introduction**、**3.2** **Attention**
+#
+# 调用位置：
+#   UploadsMiddleware 在处理上传文件后提取文档大纲
+#   来源文件：deerflow/agents/middlewares/uploads_middleware.py
+#
+# 设计考虑：
+#   - 使用正则表达式匹配不同格式的标题
+#   - 限制返回标题数量避免上下文过长
+#   - 在达到限制时添加截断标记，让调用方知道省略了部分标题
 def extract_outline(md_path: Path) -> list[dict]:
     """Extract document outline (headings) from a Markdown file.
 
@@ -252,32 +281,39 @@ def extract_outline(md_path: Path) -> list[dict]:
     """
     outline: list[dict] = []
     try:
+        # 打开文件并逐行读取
         with md_path.open(encoding="utf-8") as f:
             for lineno, line in enumerate(f, 1):
                 stripped = line.strip()
+                # 跳过空行
                 if not stripped:
                     continue
 
-                # Style 1: standard Markdown heading
+                # 格式 1：标准 Markdown 标题（以 # 开头）
                 if stripped.startswith("#"):
+                    # 移除 # 符号并清理粗体标记
                     title = _clean_bold_title(stripped.lstrip("#").strip())
                     if title:
                         outline.append({"title": title, "line": lineno})
 
-                # Style 2: single bold block with SEC structural keyword
+                # 格式 2：单个粗体块带 SEC 结构关键词
                 elif m := _BOLD_HEADING_RE.match(stripped):
+                    # 提取第一个捕获组作为标题
                     title = m.group(1).strip()
                     if title:
                         outline.append({"title": title, "line": lineno})
 
-                # Style 3: split-bold heading — **<num>** **<title>**
-                # Regex already enforces max 4 blocks and non-numeric second block.
+                # 格式 3：分割粗体标题 — **<数字>** **<标题>**
+                # 正则表达式已强制限制最多 4 个块和第二个块为非数字
                 elif _SPLIT_BOLD_HEADING_RE.match(stripped):
+                    # 提取所有粗体块并用空格连接
                     title = " ".join(re.findall(r"\*\*([^*]+)\*\*", stripped))
                     if title:
                         outline.append({"title": title, "line": lineno})
 
+                # 检查是否达到最大条目限制
                 if len(outline) >= MAX_OUTLINE_ENTRIES:
+                    # 添加截断标记
                     outline.append({"truncated": True})
                     break
     except Exception:

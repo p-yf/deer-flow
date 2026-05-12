@@ -22,33 +22,67 @@
 
 执行位置：中间件链第三位（紧接 UploadsMiddleware 之后）。
 """
+"""Middleware for sandbox lifecycle management."""
 
-# 导入标准库 logging，用于记录日志
+# ============================================================
+# 导入标准库
+# ============================================================
+
+# logging：标准库日志模块，用于记录中间件运行日志
 import logging
-# typing 导入 NotRequired（可选字段）和 override（方法重写标记）
+
+# typing 导入：
+#   - NotRequired：可选字段标记，用于状态字段定义
+#   - override：方法重写标记，用于明确表示重写父类方法
 from typing import NotRequired, override
 
-# 从 langchain.agents 导入 AgentState（agent 基础状态类）
+# ============================================================
+# 导入 LangChain / LangGraph 相关模块
+# ============================================================
+
+# langchain.agents.AgentState：
+#   LangChain agent 的基础状态类，所有自定义状态类继承自此
 from langchain.agents import AgentState
-# 从 langchain.agents.middleware 导入 AgentMiddleware（中间件基类）
+
+# langchain.agents.middleware.AgentMiddleware：
+#   LangChain 的中间件基类，所有自定义中间件必须继承此类
 from langchain.agents.middleware import AgentMiddleware
-# 从 langgraph.runtime 导入 Runtime（LangGraph 运行时上下文）
+
+# langgraph.runtime.Runtime：
+#   LangGraph 运行时上下文，在钩子方法中作为参数传入
 from langgraph.runtime import Runtime
 
-# 从 deerflow.agents.thread_state 导入 SandboxState 和 ThreadDataState
-# SandboxState 包含 sandbox_id 等沙箱状态信息
-# ThreadDataState 包含线程数据路径等信息（用于获取 thread_id）
+# ============================================================
+# 导入 DeerFlow 项目内部模块
+# ============================================================
+
+# deerflow.agents.thread_state.SandboxState 和 ThreadDataState：
+#   - SandboxState：包含 sandbox_id 等沙箱状态信息
+#   - ThreadDataState：包含线程数据路径等信息（用于获取 thread_id）
+#   来自：本项目 packages/harness/deerflow/agents/thread_state.py
 from deerflow.agents.thread_state import SandboxState, ThreadDataState
-# 从 deerflow.sandbox 导入 get_sandbox_provider 函数
-# 这个函数返回全局的 SandboxProvider 实例，用于获取和释放沙箱
+
+# deerflow.sandbox.get_sandbox_provider：
+#   这个函数返回全局的 SandboxProvider 实例，用于获取和释放沙箱
+#   来自：本项目 packages/harness/deerflow/sandbox/__init__.py
 from deerflow.sandbox import get_sandbox_provider
+
+# ============================================================
+# 模块级变量初始化
+# ============================================================
 
 # 创建模块级 logger，用于记录中间件运行日志
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 状态类型定义
+# ============================================================
+
 # SandboxMiddlewareState 类：定义中间件使用的状态 schema
-# 继承自 AgentState
+#
+# 作用说明：
+#   继承自 AgentState，作为 SandboxMiddleware 的状态类型。
 class SandboxMiddlewareState(AgentState):
     # sandbox 字段：沙箱状态信息
     # 类型是 SandboxState | None，表示可选字段
@@ -61,12 +95,19 @@ class SandboxMiddlewareState(AgentState):
     thread_data: NotRequired[ThreadDataState | None]
 
 
-# SandboxMiddleware 类：负责创建沙箱环境并分配给 agent
+# ============================================================
+# SandboxMiddleware 主类
+# ============================================================
+
+# SandboxMiddleware 类：沙箱生命周期管理中间件
+#
+# 核心作用：
+#   管理沙箱的获取和释放，确保每次线程执行都有可用的沙箱环境。
 #
 # 沙箱的作用：
-#   沙箱为 agent 提供了隔离的文件系统和命令执行环境
-#   agent 可以读写文件、执行命令，但只能访问沙箱内的资源
-#   不同线程（不同对话）使用不同的沙箱，相互隔离
+#   沙箱为 agent 提供了隔离的文件系统和命令执行环境。
+#   agent 可以读写文件、执行命令，但只能访问沙箱内的资源。
+#   不同线程（不同对话）使用不同的沙箱，相互隔离。
 #
 # 生命周期管理：
 #   - lazy_init=True（默认）：沙箱在第一次工具调用时才获取（延迟初始化）
@@ -77,17 +118,21 @@ class SandboxMiddlewareState(AgentState):
 #     SandboxProvider.shutdown() 统一清理
 #
 # 注意：
-#   这个中间件的释放逻辑在 after_agent 中
-#   但只有非 lazy_init 模式或显式设置的沙箱会被释放
-#   lazy_init 模式的沙箱获取和释放由工具执行时触发
+#   这个中间件的释放逻辑在 after_agent 中，
+#   但只有非 lazy_init 模式或显式设置的沙箱会被释放。
+#   lazy_init 模式的沙箱获取和释放由工具执行时触发。
 class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
-    # state_schema 类变量，指定该中间件使用的状态类型
+    # state_schema：类变量，指定该中间件使用的状态类型
     state_schema = SandboxMiddlewareState
 
+    # ============================================================
     # 构造函数
+    # ============================================================
+
+    # __init__：构造函数
     #
     # 参数：
-    #   lazy_init: 控制沙箱获取时机的布尔值
+    #   lazy_init: bool，控制沙箱获取时机的布尔值
     #              - True（默认）：延迟获取，沙箱在第一次工具调用时才获取
     #              - False：立即获取，在 before_agent 时就获取沙箱
     def __init__(self, lazy_init: bool = True):
@@ -96,13 +141,20 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         # 保存 lazy_init 配置
         self._lazy_init = lazy_init
 
-    # 内部方法：获取沙箱
+    # ============================================================
+    # 内部辅助方法
+    # ============================================================
+
+    # _acquire_sandbox：获取沙箱
+    #
+    # 方法作用：
+    #   从 SandboxProvider 获取一个沙箱实例。
     #
     # 参数：
-    #   thread_id: 线程的唯一标识符
+    #   thread_id: str，线程的唯一标识符
     #
     # 返回值：
-    #   sandbox_id 字符串，沙箱的唯一标识
+    #   str：沙箱的唯一标识（sandbox_id）
     #
     # 工作流程：
     #   1. 获取全局的 SandboxProvider（沙箱提供者）
@@ -117,14 +169,21 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         # 获取全局的 SandboxProvider 实例
         provider = get_sandbox_provider()
         # 调用 provider 的 acquire 方法，传入 thread_id
-        # thread_id 用于区分不同线程的沙箱资源
         sandbox_id = provider.acquire(thread_id)
         # 记录日志：获取了哪个沙箱
         logger.info(f"Acquiring sandbox {sandbox_id}")
         # 返回沙箱 ID
         return sandbox_id
 
-    # before_agent 钩子方法：在 agent 执行前被调用
+    # ============================================================
+    # LangChain AgentMiddleware 钩子方法
+    # ============================================================
+
+    # before_agent：agent 执行前的钩子
+    #
+    # 方法作用：
+    #   LangChain AgentMiddleware 提供的扩展点，
+    #   在 agent 执行前同步执行，获取沙箱环境。
     #
     # 工作逻辑：
     #   1. 如果 lazy_init=True（默认），跳过获取（沙箱会在工具调用时获取）
@@ -132,12 +191,11 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
     #   3. 返回包含 sandbox_id 的状态更新
     #
     # 参数：
-    #   state: 当前 agent 状态（SandboxMiddlewareState）
-    #   runtime: LangGraph 运行时上下文（包含 thread_id）
+    #   state: SandboxMiddlewareState，当前 agent 状态
+    #   runtime: Runtime，LangGraph 运行时上下文（包含 thread_id）
     #
     # 返回值：
-    #   状态更新字典，包含 sandbox 信息
-    #   返回 None 表示不需要更新状态
+    #   dict | None：状态更新字典，包含 sandbox 信息
     @override
     def before_agent(self, state: SandboxMiddlewareState, runtime: Runtime) -> dict | None:
         # 如果 lazy_init=True，跳过获取操作
@@ -160,13 +218,16 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             # 记录日志：沙箱分配给哪个线程
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
             # 返回状态更新，包含 sandbox 信息
-            # 状态中的 sandbox 字段会是一个字典 {sandbox_id: "..."}
             return {"sandbox": {"sandbox_id": sandbox_id}}
 
         # state 中已有 sandbox 信息，不需要再次获取
         return super().before_agent(state, runtime)
 
-    # after_agent 钩子方法：在 agent 执行后被调用
+    # after_agent：agent 执行后的钩子
+    #
+    # 方法作用：
+    #   LangChain AgentMiddleware 提供的扩展点，
+    #   在 agent 执行后同步执行，释放沙箱环境。
     #
     # 工作逻辑：
     #   1. 检查 state 中是否有 sandbox 信息
@@ -174,17 +235,16 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
     #   3. 也检查 runtime.context 中是否有 sandbox_id（备选来源）
     #
     # 参数：
-    #   state: 当前 agent 状态（SandboxMiddlewareState）
-    #   runtime: LangGraph 运行时上下文
+    #   state: SandboxMiddlewareState，当前 agent 状态
+    #   runtime: Runtime，LangGraph 运行时上下文
     #
     # 返回值：
-    #   总是返回 None（这个中间件不修改状态）
+    #   dict | None：总是返回 None（这个中间件不修改状态）
     #
     # 注意：
     #   - 对于 lazy_init=True 的情况，沙箱获取和释放通常由工具处理
     #   - 这里只处理非 lazy_init 模式下在 before_agent 获取的沙箱
     #   - LocalSandboxProvider 的 release() 是空操作（单例模式）
-    #     因为 LocalSandbox 是全局单例，不需要真正释放
     @override
     def after_agent(self, state: SandboxMiddlewareState, runtime: Runtime) -> dict | None:
         # 从 state 中获取 sandbox 信息
@@ -195,16 +255,12 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             # 记录日志：释放沙箱
             logger.info(f"Releasing sandbox {sandbox_id}")
             # 调用 provider.release() 释放沙箱
-            # 对于 LocalSandboxProvider，这是空操作
-            # 对于 Docker 沙箱，会停止并删除容器
             get_sandbox_provider().release(sandbox_id)
             return None
 
         # 备选：从 runtime.context 中获取 sandbox_id
-        # 这处理了一些特殊情况
         if (runtime.context or {}).get("sandbox_id") is not None:
             sandbox_id = runtime.context.get("sandbox_id")
-            # 记录日志：从上下文中释放沙箱
             logger.info(f"Releasing sandbox {sandbox_id} from context")
             get_sandbox_provider().release(sandbox_id)
             return None

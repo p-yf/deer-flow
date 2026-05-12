@@ -529,6 +529,20 @@ class SubagentExecutor:
         return task_id
 
 
+# MAX_CONCURRENT_SUBAGENTS：最大并发子代理数量常量
+#
+# 作用说明：
+#   限制同时运行的子代理任务的最大数量。
+#   用于防止子代理系统过载，确保系统资源合理分配。
+#
+# 调用位置：
+#   SubagentLimitMiddleware 调用此常量检查是否需要截断多余的 task 工具调用
+#   来源文件：deerflow/agents/middlewares/subagent_limit_middleware.py
+#
+# 设计考虑：
+#   - 这是一个进程级全局常量，简化了并发控制逻辑
+#   - 与 SubagentExecutor 内部的执行池大小配合使用（_execution_pool max_workers=3）
+#   - 值被设置为 3，与执行池大小匹配，确保不会超过系统承载能力
 MAX_CONCURRENT_SUBAGENTS = 3
 
 

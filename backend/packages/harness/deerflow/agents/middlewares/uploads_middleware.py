@@ -24,57 +24,96 @@
 
 执行位置：中间件链第二位（紧接 ThreadDataMiddleware 之后）。
 """
+"""Middleware for injecting uploaded file information into agent context."""
 
-# 导入标准库 logging，用于记录日志
+# ============================================================
+# 导入标准库
+# ============================================================
+
+# logging：标准库日志模块，用于记录中间件运行日志
 import logging
-# pathlib.Path 用于处理文件路径
+
+# pathlib.Path：用于处理文件路径
 from pathlib import Path
-# typing 导入 NotRequired（可选字段）和 override（方法重写标记）
+
+# typing 导入：
+#   - NotRequired：可选字段标记，用于状态字段定义
+#   - override：方法重写标记，用于明确表示重写父类方法
 from typing import NotRequired, override
 
-# 从 langchain.agents 导入 AgentState（agent 基础状态类）
+# ============================================================
+# 导入 LangChain / LangGraph 相关模块
+# ============================================================
+
+# langchain.agents.AgentState：
+#   LangChain agent 的基础状态类，所有自定义状态类继承自此
 from langchain.agents import AgentState
-# 从 langchain.agents.middleware 导入 AgentMiddleware（中间件基类）
+
+# langchain.agents.middleware.AgentMiddleware：
+#   LangChain 的中间件基类，所有自定义中间件必须继承此类
 from langchain.agents.middleware import AgentMiddleware
-# 从 langchain_core.messages 导入 HumanMessage（人类消息类型）
-# 中间件需要检查最后一条人类消息是否包含上传文件信息
+
+# langchain_core.messages.HumanMessage：
+#   人类消息类型，中间件需要检查最后一条人类消息是否包含上传文件信息
 from langchain_core.messages import HumanMessage
-# 从 langgraph.runtime 导入 Runtime（LangGraph 运行时上下文）
+
+# langgraph.runtime.Runtime：
+#   LangGraph 运行时上下文，在钩子方法中作为参数传入
 from langgraph.runtime import Runtime
 
-# 从 deerflow.config.paths 导入 Paths 和 get_paths
-# 用于解析上传目录的路径
+# ============================================================
+# 导入 DeerFlow 项目内部模块
+# ============================================================
+
+# deerflow.config.paths.Paths 和 get_paths：
+#   Paths 类用于解析和构建各种路径，get_paths() 返回全局的 Paths 实例
+#   用于解析上传目录的路径
+#   来自：本项目 packages/harness/deerflow/config/paths.py
 from deerflow.config.paths import Paths, get_paths
-# 从 deerflow.utils.file_conversion 导入 extract_outline 函数
-# 这个函数从 Markdown 文件中提取标题大纲（用于文档结构展示）
+
+# deerflow.utils.file_conversion.extract_outline：
+#   这个函数从 Markdown 文件中提取标题大纲（用于文档结构展示）
+#   来自：本项目 packages/harness/deerflow/utils/file_conversion.py
 from deerflow.utils.file_conversion import extract_outline
+
+# ============================================================
+# 模块级变量初始化
+# ============================================================
 
 # 创建模块级 logger，用于记录中间件运行日志
 logger = logging.getLogger(__name__)
 
-# 模块级常量：定义预览行数
+# ============================================================
+# 模块级常量定义
+# ============================================================
+
+# _OUTLINE_PREVIEW_LINES：预览行数
 # 当文档没有标题时，读取转换后的 .md 文件的前几行作为内容预览
 _OUTLINE_PREVIEW_LINES = 5
 
 
-# 模块级函数：为一个上传的文件提取文档大纲和预览
+# ============================================================
+# 模块级辅助函数
+# ============================================================
+
+# _extract_outline_for_file：为一个上传的文件提取文档大纲和预览
+#
+# 方法作用：
+#   上传的文件会通过转换管道转换成同名的 .md 文件。
+#   例如 file.pdf 会转换成 file.pdf.md。
+#   这个函数查找这个 .md 文件并提取标题信息。
 #
 # 参数：
 #   file_path: Path 对象，指向实际的上传文件（如 PDF、Word 等）
 #
-# 工作原理：
-#   上传的文件会通过转换管道转换成同名的 .md 文件
-#   例如 file.pdf 会转换成 file.pdf.md
-#   这个函数查找这个 .md 文件并提取标题信息
-#
 # 返回值：
-#   一个元组 (outline, preview)
-#   - outline: 标题列表，每个元素是 {title, line} 字典
-#              表示标题文字和标题所在的行号
-#              如果没有标题或 .md 文件不存在则为空列表
-#   - preview: 前几行非空内容
-#              当 outline 为空时使用，作为备选内容提示
-#              当 outline 非空时为空列表（不需要 preview）
+#   tuple[list[dict], list[str]]：元组
+#     - outline: 标题列表，每个元素是 {title, line} 字典
+#                表示标题文字和标题所在的行号
+#                如果没有标题或 .md 文件不存在则为空列表
+#     - preview: 前几行非空内容
+#                当 outline 为空时使用，作为备选内容提示
+#                当 outline 非空时为空列表（不需要 preview）
 def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     # 将文件路径的后缀替换为 .md
     # 例如 /path/to/doc.pdf -> /path/to/doc.pdf.md
@@ -85,7 +124,6 @@ def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
         return [], []
 
     # 调用 extract_outline 函数从 .md 文件中提取标题
-    # 这个函数返回标题列表
     outline = extract_outline(md_path)
 
     # 如果成功提取到标题，直接返回（preview 为空列表）
@@ -105,7 +143,7 @@ def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
                 # 跳过空行
                 if stripped:
                     preview.append(stripped)
-                # 达到预览行数上限（_OUTLINE_PREVIEW_LINES = 5）停止读取
+                # 达到预览行数上限停止读取
                 if len(preview) >= _OUTLINE_PREVIEW_LINES:
                     break
     except Exception:
@@ -116,8 +154,14 @@ def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     return [], preview
 
 
+# ============================================================
+# 状态类型定义
+# ============================================================
+
 # UploadsMiddlewareState 类：定义中间件使用的状态 schema
-# 继承自 AgentState
+#
+# 作用说明：
+#   继承自 AgentState，作为 UploadsMiddleware 的状态类型。
 class UploadsMiddlewareState(AgentState):
     # uploaded_files 字段：本次新上传的文件列表
     # 类型是 list[dict] | None，表示可选字段
@@ -125,7 +169,15 @@ class UploadsMiddlewareState(AgentState):
     uploaded_files: NotRequired[list[dict] | None]
 
 
-# UploadsMiddleware 类：负责将上传文件信息注入到 agent 上下文
+# ============================================================
+# UploadsMiddleware 主类
+# ============================================================
+
+# UploadsMiddleware 类：上传文件信息注入中间件
+#
+# 核心作用：
+#   当用户上传文件后，将文件信息注入到 agent 上下文中，
+#   让模型知道有哪些文件可以操作。
 #
 # 工作流程：
 #   1. 在 before_agent 时检查最后一条人类消息是否包含上传文件信息
@@ -141,32 +193,35 @@ class UploadsMiddlewareState(AgentState):
 #   - additional_kwargs 被保留，让前端可以从流式消息中读取文件元数据
 #   - 文件路径使用虚拟路径 /mnt/user-data/uploads/，不是物理路径
 class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
-    # state_schema 类变量，指定该中间件使用的状态类型
+    # state_schema：类变量，指定该中间件使用的状态类型
     state_schema = UploadsMiddlewareState
 
+    # ============================================================
     # 构造函数
+    # ============================================================
+
+    # __init__：构造函数
     #
     # 参数：
-    #   base_dir: 线程数据的根目录，默认为 None（使用 Paths 默认解析）
+    #   base_dir: str | None，线程数据的根目录，默认为 None（使用 Paths 默认解析）
     def __init__(self, base_dir: str | None = None):
         # 调用父类构造函数
         super().__init__()
         # 如果提供了 base_dir，用它创建 Paths 实例；否则使用全局 Paths 实例
         self._paths = Paths(base_dir) if base_dir else get_paths()
 
-    # 内部方法：为单个文件格式化条目信息，追加到 lines 列表中
+    # ============================================================
+    # 内部辅助方法
+    # ============================================================
+
+    # _format_file_entry：为单个文件格式化条目信息
     #
-    # 这个方法生成类似如下的格式化文本：
-    #   - report.pdf (245.6 KB)
-    #     Path: /mnt/user-data/uploads/report.pdf
-    #     Document outline (use `read_file` with line ranges to read sections):
-    #       L45: Executive Summary
-    #       L78: Financial Analysis
-    #       ...
+    # 方法作用：
+    #   生成格式化的文件信息文本，追加到 lines 列表中。
     #
     # 参数：
-    #   file: 文件信息字典，包含 filename、size、path、outline 等字段
-    #   lines: 用于追加格式化文本的列表（就地修改）
+    #   file: dict，文件信息字典，包含 filename、size、path、outline 等字段
+    #   lines: list[str]，用于追加格式化文本的列表（就地修改）
     def _format_file_entry(self, file: dict, lines: list[str]) -> None:
         # 计算文件大小字符串
         # size 是字节数，除以 1024 得到 KB
@@ -183,7 +238,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         outline = file.get("outline") or []
 
         if outline:
-            # 有大纲的情况：
+            # 有大纲的情况
             # 检查大纲是否被截断（最后一条记录有 truncated=True 表示截断）
             truncated = outline[-1].get("truncated", False)
             # 过滤掉 truncated 的条目，只显示完整的标题
@@ -199,7 +254,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
             if truncated:
                 lines.append(f"    ... (showing first {len(visible)} headings; use `read_file` to explore further)")
         else:
-            # 没有大纲的情况：
+            # 没有大纲的情况
             # 检查是否有内容预览（当没有标题时使用）
             preview = file.get("outline_preview") or []
             if preview:
@@ -215,18 +270,17 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         # 添加空行分隔
         lines.append("")
 
-    # 内部方法：创建格式化的文件列表消息
+    # _create_files_message：创建格式化的文件列表消息
+    #
+    # 方法作用：
+    #   将新上传的文件和历史文件格式化为一个字符串消息。
     #
     # 参数：
-    #   new_files: 本次新上传的文件列表
-    #   historical_files: 历史文件列表（之前上传的）
+    #   new_files: list[dict]，本次新上传的文件列表
+    #   historical_files: list[dict]，历史文件列表（之前上传的）
     #
     # 返回值：
-    #   格式化的字符串，包含在 <uploaded_files> 和 </uploaded_files> 标签之间
-    #   内容结构：
-    #     - 本次上传的文件列表
-    #     - 历史文件列表
-    #     - 文件使用提示
+    #   str：格式化的字符串，包含在 <uploaded_files> 和 </uploaded_files> 标签之间
     def _create_files_message(self, new_files: list[dict], historical_files: list[dict]) -> str:
         # 初始化 lines 列表，以 <uploaded_files> 标签开始
         lines = ["<uploaded_files>"]
@@ -264,22 +318,21 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         # 将所有行合并成单个字符串，用换行符分隔
         return "\n".join(lines)
 
-    # 内部方法：从消息的 additional_kwargs 中提取文件信息
+    # _files_from_kwargs：从消息的 additional_kwargs 中提取文件信息
     #
-    # 工作原理：
-    #   前端上传文件后，会在消息的 additional_kwargs 中设置 files 字段
-    #   这个字段是一个列表，每个元素包含 filename、size、path、status 等
+    # 方法作用：
+    #   前端上传文件后，会在消息的 additional_kwargs 中设置 files 字段。
+    #   这个方法从这个字段中提取文件信息。
     #
     # 参数：
     #   message: HumanMessage，要检查的人类消息
-    #   uploads_dir: 可选的 Path 对象，用于验证文件是否真实存在
-    #                如果文件不存在，该条目会被跳过
+    #   uploads_dir: Path | None，可选的 Path 对象，用于验证文件是否真实存在
     #
     # 返回值：
-    #   文件信息字典列表，每个字典包含：
+    #   list[dict] | None：文件信息字典列表，每个字典包含：
     #     - filename: 文件名
     #     - size: 文件大小（字节）
-    #     - path: 虚拟路径（/mnt/user-data/uploads/{filename}）
+    #     - path: 虚拟路径
     #     - extension: 文件扩展名
     #   如果没有文件信息或字段为空，返回 None
     def _files_from_kwargs(self, message: HumanMessage, uploads_dir: Path | None = None) -> list[dict] | None:
@@ -314,8 +367,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
                 {
                     "filename": filename,  # 文件名
                     "size": int(f.get("size") or 0),  # 大小（字节），转换为 int
-                    # 虚拟路径：agent 使用这个路径访问文件
-                    "path": f"/mnt/user-data/uploads/{filename}",
+                    "path": f"/mnt/user-data/uploads/{filename}",  # 虚拟路径
                     "extension": Path(filename).suffix,  # 文件扩展名（如 .pdf、.docx）
                 }
             )
@@ -323,7 +375,15 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         # 如果有文件返回列表，否则返回 None
         return files if files else None
 
-    # before_agent 钩子方法：在 agent 执行前被调用
+    # ============================================================
+    # LangChain AgentMiddleware 钩子方法
+    # ============================================================
+
+    # before_agent：agent 执行前的钩子
+    #
+    # 方法作用：
+    #   LangChain AgentMiddleware 提供的扩展点，
+    #   在 agent 执行前同步执行，将上传文件信息注入到消息中。
     #
     # 工作流程：
     #   1. 获取消息列表，检查最后一条是否是 HumanMessage
@@ -334,18 +394,19 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
     #   6. 返回状态更新（messages 和 uploaded_files）
     #
     # 参数：
-    #   state: 当前 agent 状态（UploadsMiddlewareState）
-    #   runtime: LangGraph 运行时上下文（包含 thread_id）
+    #   state: UploadsMiddlewareState，当前 agent 状态
+    #   runtime: Runtime，LangGraph 运行时上下文（包含 thread_id）
     #
     # 返回值：
-    #   状态更新字典，包含：
-    #     - messages: 更新后的消息列表（最后一条 HumanMessage 内容被修改）
+    #   dict | None：状态更新字典，包含：
+    #     - messages: 更新后的消息列表
     #     - uploaded_files: 本次新上传的文件列表
     #   如果没有文件或消息列表为空，返回 None
     @override
     def before_agent(self, state: UploadsMiddlewareState, runtime: Runtime) -> dict | None:
         # 从 state 中获取消息列表
         messages = list(state.get("messages", []))
+
         # 如果没有消息，直接返回 None
         if not messages:
             return None
@@ -354,7 +415,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         last_message_index = len(messages) - 1
         last_message = messages[last_message_index]
 
-        # 确保最后一条消息是人类消息（只有人类消息可以包含上传文件）
+        # 确保最后一条消息是人类消息
         if not isinstance(last_message, HumanMessage):
             return None
 
@@ -408,7 +469,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
                 file["outline"] = outline
                 file["outline_preview"] = preview
 
-        # 如果既没有新文件也没有历史文件，直接返回 None（不需要修改消息）
+        # 如果既没有新文件也没有历史文件，直接返回 None
         if not new_files and not historical_files:
             return None
 
@@ -419,7 +480,6 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         files_message = self._create_files_message(new_files, historical_files)
 
         # 提取原始消息内容
-        # 消息内容可能是字符串或列表（列表通常是 {type: "text", text: "..."} 格式）
         original_content = ""
         if isinstance(last_message.content, str):
             # 字符串格式：直接使用
@@ -445,9 +505,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         messages[last_message_index] = updated_message
 
         # 返回状态更新
-        # - messages: 更新后的消息列表（文件信息已添加到用户消息前）
-        # - uploaded_files: 本次新上传的文件列表（用于后续处理）
         return {
-            "uploaded_files": new_files,
-            "messages": messages,
+            "uploaded_files": new_files,  # 本次新上传的文件列表
+            "messages": messages,  # 更新后的消息列表
         }

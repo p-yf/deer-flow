@@ -38,53 +38,92 @@ Detection strategy:
      response so the agent is forced to produce a final text answer.
 """
 
+# ============================================================
 # 导入标准库
-# hashlib: 用于计算工具调用的哈希值
+# ============================================================
+
+# hashlib：标准库哈希模块，用于计算工具调用的 MD5 哈希值
 import hashlib
-# json: 用于序列化和反序列化 JSON 数据
+
+# json：标准库 JSON 模块，用于序列化和反序列化 JSON 数据
 import json
-# logging: 用于记录日志
+
+# logging：标准库日志模块，用于记录中间件运行日志
 import logging
-# threading: 用于线程安全的锁
+
+# threading：标准库线程模块，用于线程安全的锁
 import threading
-# collections: 导入 OrderedDict（有序字典）和 defaultdict（默认值字典）
+
+# collections 导入：
+#   - OrderedDict：有序字典，用于实现 LRU 缓存
+#   - defaultdict：默认值字典，用于存储每个线程的已警告哈希集合
 from collections import OrderedDict, defaultdict
-# typing: 导入 override（方法重写标记）
+
+# typing 导入：
+#   - override：方法重写标记，用于明确表示重写父类方法
 from typing import override
 
-# 从 langchain.agents 导入 AgentState（agent 基础状态类）
+# ============================================================
+# 导入 LangChain / LangGraph 相关模块
+# ============================================================
+
+# langchain.agents.AgentState：
+#   LangChain agent 的基础状态类，所有自定义状态类继承自此
 from langchain.agents import AgentState
-# 从 langchain.agents.middleware 导入 AgentMiddleware（中间件基类）
+
+# langchain.agents.middleware.AgentMiddleware：
+#   LangChain 的中间件基类，所有自定义中间件必须继承此类
 from langchain.agents.middleware import AgentMiddleware
-# 从 langchain_core.messages 导入 HumanMessage（人类消息）
-# 用于注入警告消息（注意：不是 SystemMessage）
+
+# langchain_core.messages.HumanMessage：
+#   人类消息类型，用于注入警告消息
+#   注意：使用 HumanMessage 而不是 SystemMessage
+#   原因：某些模型（如 Anthropic）要求系统消息只在对话开始时出现
 from langchain_core.messages import HumanMessage
-# 从 langgraph.runtime 导入 Runtime（LangGraph 运行时上下文）
+
+# langgraph.runtime.Runtime：
+#   LangGraph 运行时上下文，在钩子方法中作为参数传入
 from langgraph.runtime import Runtime
+
+# ============================================================
+# 模块级变量初始化
+# ============================================================
 
 # 创建模块级 logger，用于记录中间件运行日志
 logger = logging.getLogger(__name__)
 
-# 模块级常量：默认阈值
-# 可以通过构造函数覆盖
-_DEFAULT_WARN_THRESHOLD = 3  # 注入警告前的相同调用次数
-_DEFAULT_HARD_LIMIT = 5     # 强制停止前的相同调用次数
-_DEFAULT_WINDOW_SIZE = 20     # 跟踪最近 N 个工具调用
+# ============================================================
+# 模块级常量定义
+# ============================================================
+
+# 默认阈值常量：可以通过构造函数覆盖
+_DEFAULT_WARN_THRESHOLD = 3   # 注入警告前的相同调用次数
+_DEFAULT_HARD_LIMIT = 5       # 强制停止前的相同调用次数
+_DEFAULT_WINDOW_SIZE = 20     # 跟踪最近 N 个工具调用哈希
 _DEFAULT_MAX_TRACKED_THREADS = 100  # LRU 驱逐限制：最大跟踪线程数
 
 
-# 模块级函数：标准化工具调用参数
+# ============================================================
+# 模块级辅助函数
+# ============================================================
+
+# _normalize_tool_call_args：标准化工具调用参数
 #
-# 兼容处理：有些 provider 将 args 序列化为 JSON 字符串而不是字典
-# 这个函数防御性地解析这些情况，同时为非字典负载保留稳定的回退键
+# 方法作用：
+#   兼容处理不同 provider 将 args 序列化为不同格式的情况，
+#   同时为非字典负载保留稳定的回退键。
 #
 # 参数：
-#   raw_args: 原始参数（可能是 dict、str 或 None）
+#   raw_args: object，原始参数（可能是 dict、str 或 None）
 #
 # 返回值：
-#   (dict, str | None) 元组
-#   - dict: 标准化的参数字典
-#   - str | None: 如果无法标准化，返回原始值的 JSON 字符串作为回退键
+#   tuple[dict, str | None]：元组
+#     - dict: 标准化的参数字典
+#     - str | None: 如果无法标准化，返回原始值的 JSON 字符串作为回退键
+#
+# 兼容处理：
+#   有些 provider 将 args 序列化为 JSON 字符串而不是字典
+#   这个函数防御性地解析这些情况，同时为非字典负载保留稳定的回退键
 def _normalize_tool_call_args(raw_args: object) -> tuple[dict, str | None]:
     """Normalize tool call args to a dict plus an optional fallback key.
 
@@ -118,15 +157,19 @@ def _normalize_tool_call_args(raw_args: object) -> tuple[dict, str | None]:
     return {}, json.dumps(raw_args, sort_keys=True, default=str)
 
 
-# 模块级函数：从显著的参数生成稳定的键
+# _stable_tool_key：从显著参数生成稳定的键
+#
+# 方法作用：
+#   从工具调用的显著参数生成一个稳定的键，用于哈希计算。
+#   不同类型的工具使用不同的键生成策略。
 #
 # 参数：
-#   name: 工具名称
-#   args: 参数字典
-#   fallback_key: 回退键（如果参数无法标准化时使用）
+#   name: str，工具名称
+#   args: dict，参数字典
+#   fallback_key: str | None，如果参数无法标准化时使用的回退键
 #
 # 返回值：
-#   字符串，稳定的工具调用键
+#   str：稳定的工具调用键
 #
 # 设计考虑：
 #   - read_file：按行号范围分桶（每 200 行为一个桶），避免微小差异导致不同哈希
@@ -136,11 +179,13 @@ def _stable_tool_key(name: str, args: dict, fallback_key: str | None) -> str:
     """Derive a stable key from salient args without overfitting to noise."""
     # read_file 特殊处理：按行号范围分桶
     if name == "read_file" and fallback_key is None:
+        # 获取路径和行号范围
         path = args.get("path") or ""
         start_line = args.get("start_line")
         end_line = args.get("end_line")
 
-        bucket_size = 200  # 每 200 行为一个桶
+        # 每 200 行为一个桶
+        bucket_size = 200
 
         # 安全转换 start_line 为整数
         try:
@@ -156,7 +201,8 @@ def _stable_tool_key(name: str, args: dict, fallback_key: str | None) -> str:
 
         # 确保 start_line <= end_line
         start_line, end_line = sorted((start_line, end_line))
-        # 计算桶范围（从 0 开始）
+
+        # 计算桶范围（行号从 1 开始，所以需要减 1）
         bucket_start = max(start_line, 1)
         bucket_end = max(end_line, 1)
         bucket_start = (bucket_start - 1) // bucket_size
@@ -189,13 +235,16 @@ def _stable_tool_key(name: str, args: dict, fallback_key: str | None) -> str:
     return json.dumps(args, sort_keys=True, default=str)
 
 
-# 模块级函数：对工具调用列表进行确定性哈希
+# _hash_tool_calls：对工具调用列表进行确定性哈希
+#
+# 方法作用：
+#   将工具调用列表转换为一个确定性的哈希值，用于检测循环。
 #
 # 参数：
-#   tool_calls: 工具调用列表
+#   tool_calls: list[dict]，工具调用列表
 #
 # 返回值：
-#   字符串，12 字符的 MD5 哈希
+#   str：12 字符的 MD5 哈希
 #
 # 设计考虑：
 #   - 顺序无关：相同的多集合工具调用产生相同的哈希
@@ -219,6 +268,7 @@ def _hash_tool_calls(tool_calls: list[dict]) -> str:
 
     # 排序，使不同顺序的相同调用集合产生相同结果
     normalized.sort()
+
     # JSON 序列化后计算 MD5 哈希，只取前 12 字符
     blob = json.dumps(normalized, sort_keys=True, default=str)
     return hashlib.md5(blob.encode()).hexdigest()[:12]
@@ -227,13 +277,22 @@ def _hash_tool_calls(tool_calls: list[dict]) -> str:
 # 模块级字符串常量：警告消息和强制停止消息
 #
 # 警告消息：出现在达到 warn_threshold 次时
+# 提示 agent 停止调用工具，产生最终回答
 _WARNING_MSG = "[LOOP DETECTED] You are repeating the same tool calls. Stop calling tools and produce your final answer now. If you cannot complete the task, summarize what you accomplished so far."
 
 # 强制停止消息：出现在达到 hard_limit 次时
+# 强制剥离所有 tool_calls，强制产生文本回答
 _HARD_STOP_MSG = "[FORCED STOP] Repeated tool calls exceeded the safety limit. Producing final answer with results collected so far."
 
 
+# ============================================================
+# LoopDetectionMiddleware 主类
+# ============================================================
+
 # LoopDetectionMiddleware 类：检测和打破重复工具调用循环
+#
+# 核心作用：
+#   P0 安全机制，防止 agent 无限循环调用相同的工具和参数。
 #
 # 工作流程：
 #   1. 在 after_model 钩子中检查最后一条 AI 消息是否有 tool_calls
@@ -260,13 +319,20 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             evicting the least recently used. Default: 100.
     """
 
+    # state_schema：类变量，指定该中间件使用的状态类型
+    state_schema = AgentState
+
+    # ============================================================
     # 构造函数
+    # ============================================================
+
+    # __init__：构造函数
     #
     # 参数：
-    #   warn_threshold: 相同调用次数达到此值时注入警告（默认 3）
-    #   hard_limit: 相同调用次数达到此值时强制停止（默认 5）
-    #   window_size: 滑动窗口大小（默认 20）
-    #   max_tracked_threads: 最大跟踪线程数，超过则 LRU 驱逐（默认 100）
+    #   warn_threshold: int，相同调用次数达到此值时注入警告（默认 3）
+    #   hard_limit: int，相同调用次数达到此值时强制停止（默认 5）
+    #   window_size: int，滑动窗口大小（默认 20）
+    #   max_tracked_threads: int，最大跟踪线程数，超过则 LRU 驱逐（默认 100）
     def __init__(
         self,
         warn_threshold: int = _DEFAULT_WARN_THRESHOLD,
@@ -276,13 +342,14 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     ):
         # 调用父类构造函数
         super().__init__()
+
         # 保存配置参数
         self.warn_threshold = warn_threshold
         self.hard_limit = hard_limit
         self.window_size = window_size
         self.max_tracked_threads = max_tracked_threads
 
-        # 线程锁，保护共享数据结构
+        # 线程锁，保护共享数据结构（_history 和 _warned）
         self._lock = threading.Lock()
 
         # Per-thread 跟踪历史：OrderedDict 实现 LRU
@@ -293,23 +360,38 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # key: thread_id, value: 哈希集合
         self._warned: dict[str, set[str]] = defaultdict(set)
 
-    # 内部方法：从 runtime 提取 thread_id
+    # ============================================================
+    # 内部辅助方法
+    # ============================================================
+
+    # _get_thread_id：从 runtime 提取 thread_id
+    #
+    # 方法作用：
+    #   从 LangGraph 运行时上下文获取 thread_id，
+    #   用于每个线程独立跟踪。
     #
     # 参数：
-    #   runtime: LangGraph 运行时上下文
+    #   runtime: Runtime，LangGraph 运行时上下文
     #
     # 返回值：
-    #   thread_id 字符串，如果找不到则返回 "default"
+    #   str：thread_id 字符串，如果找不到则返回 "default"
     def _get_thread_id(self, runtime: Runtime) -> str:
         """Extract thread_id from runtime context for per-thread tracking."""
+        # runtime.context 是 LangGraph 传递的上下文信息字典
         thread_id = runtime.context.get("thread_id") if runtime.context else None
         if thread_id:
             return thread_id
+        # 如果没有找到 thread_id，使用 "default" 作为回退
         return "default"
 
-    # 内部方法：如果跟踪的线程数超过限制，执行 LRU 驱逐
+    # _evict_if_needed：如果跟踪的线程数超过限制，执行 LRU 驱逐
     #
-    # 注意：必须在持有 self._lock 的情况下调用
+    # 方法作用：
+    #   当跟踪的线程数超过 max_tracked_threads 时，
+    #   驱逐最旧的（least recently used）线程的跟踪数据。
+    #
+    # 注意：
+    #   必须在持有 self._lock 的情况下调用
     def _evict_if_needed(self) -> None:
         """Evict least recently used threads if over the limit.
 
@@ -318,28 +400,32 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # 当历史记录超过最大线程数时
         while len(self._history) > self.max_tracked_threads:
             # 驱逐最旧的（OrderedDict 的第一项）
+            # popitem(last=False) 返回并移除第一项 (key, value)
             evicted_id, _ = self._history.popitem(last=False)
-            # 同时清除警告记录
+            # 同时清除该线程的警告记录
             self._warned.pop(evicted_id, None)
             logger.debug("Evicted loop tracking for thread %s (LRU)", evicted_id)
 
-    # 内部方法：跟踪工具调用并检查是否有循环
+    # _track_and_check：跟踪工具调用并检查是否有循环
+    #
+    # 方法作用：
+    #   在滑动窗口中跟踪工具调用的哈希，并检查是否达到警告或停止阈值。
     #
     # 参数：
     #   state: AgentState，当前 agent 状态
-    #   runtime: LangGraph 运行时上下文
+    #   runtime: Runtime，LangGraph 运行时上下文
     #
     # 返回值：
-    #   (warning_message_or_none, should_hard_stop) 元组
-    #   - 第一个元素：警告消息字符串，如果不需要警告则为 None
-    #   - 第二个元素：是否应该强制停止
+    #   tuple[str | None, bool]：元组
+    #     - 第一个元素：警告消息字符串，如果不需要警告则为 None
+    #     - 第二个元素：是否应该强制停止
     def _track_and_check(self, state: AgentState, runtime: Runtime) -> tuple[str | None, bool]:
         """Track tool calls and check for loops.
 
         Returns:
             (warning_message_or_none, should_hard_stop)
         """
-        # 获取消息列表
+        # 从状态中获取消息列表
         messages = state.get("messages", [])
         if not messages:
             return None, False
@@ -350,7 +436,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         if getattr(last_msg, "type", None) != "ai":
             return None, False
 
-        # 获取工具调用
+        # 获取工具调用列表
         tool_calls = getattr(last_msg, "tool_calls", None)
         if not tool_calls:
             return None, False
@@ -374,10 +460,11 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
             # 获取该线程的跟踪历史
             history = self._history[thread_id]
-            # 添加当前哈希
+            # 添加当前哈希到历史
             history.append(call_hash)
 
             # 如果历史超过窗口大小，裁剪到窗口大小
+            # 只保留最近的 window_size 个哈希
             if len(history) > self.window_size:
                 history[:] = history[-self.window_size:]
 
@@ -387,7 +474,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             # 获取工具名称列表（用于日志）
             tool_names = [tc.get("name", "?") for tc in tool_calls]
 
-            # 检查是否达到硬限制
+            # ---- 检查是否达到硬限制 ----
             if count >= self.hard_limit:
                 # 记录错误日志
                 logger.error(
@@ -402,7 +489,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                 # 返回强制停止消息和 True
                 return _HARD_STOP_MSG, True
 
-            # 检查是否达到警告阈值
+            # ---- 检查是否达到警告阈值 ----
             if count >= self.warn_threshold:
                 warned = self._warned[thread_id]
                 # 如果这个哈希还没警告过
@@ -427,14 +514,18 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # 没有达到任何阈值，正常继续
         return None, False
 
-    # 静态方法：向 AIMessage 内容追加文本
+    # _append_text：向 AIMessage 内容追加文本
+    #
+    # 方法作用：
+    #   向 AIMessage 的 content 字段追加文本，
+    #   处理各种可能的 content 类型。
     #
     # 参数：
-    #   content: AIMessage 的 content 字段（可能是 str、list 或 None）
-    #   text: 要追加的文本
+    #   content: str | list | None，AIMessage 的 content 字段
+    #   text: str，要追加的文本
     #
     # 返回值：
-    #   更新后的 content（类型与输入相同）
+    #   str | list：更新后的 content（类型与输入相同）
     #
     # 兼容处理：
     #   - 如果是 list（如 Anthropic thinking 模式），追加新的 text block
@@ -458,14 +549,18 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # 其他类型，转换为字符串后拼接
         return str(content) + f"\n\n{text}"
 
-    # 内部方法：应用循环检测逻辑
+    # _apply：应用循环检测逻辑
+    #
+    # 方法作用：
+    #   根据 _track_and_check 的结果，应用相应的动作
+    #   （注入警告消息或强制停止）。
     #
     # 参数：
     #   state: AgentState，当前 agent 状态
-    #   runtime: LangGraph 运行时上下文
+    #   runtime: Runtime，LangGraph 运行时上下文
     #
     # 返回值：
-    #   状态更新字典，如果不需要更新则返回 None
+    #   dict | None：状态更新字典，如果不需要更新则返回 None
     def _apply(self, state: AgentState, runtime: Runtime) -> dict | None:
         # 调用跟踪和检查方法
         warning, hard_stop = self._track_and_check(state, runtime)
@@ -487,31 +582,59 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         if warning:
             # 达到警告阈值：注入警告消息
             # 注意：使用 HumanMessage 而不是 SystemMessage
-            # 原因：Anthropic 模型要求系统消息只在对话开始时出现
-            # 中间注入系统消息会导致 _format_messages() 崩溃
+            # 原因：某些模型（如 Anthropic）要求系统消息只在对话开始时出现
+            # 中间注入系统消息会导致格式错误
             # HumanMessage 与所有 provider 兼容
             return {"messages": [HumanMessage(content=warning)]}
 
         return None
 
-    # after_model 钩子方法：同步版本
+    # ============================================================
+    # LangChain AgentMiddleware 钩子方法
+    # ============================================================
+
+    # after_model：同步版本的模型调用后钩子
     #
-    # 在模型执行后被调用，检查循环
+    # 方法作用：
+    #   LangChain AgentMiddleware 提供的扩展点，
+    #   在模型执行后同步执行循环检测。
+    #
+    # 参数：
+    #   state: AgentState，当前 agent 状态
+    #   runtime: Runtime，LangGraph 运行时上下文
+    #
+    # 返回值：
+    #   dict | None：状态更新字典，如果不需要更新则返回 None
     @override
     def after_model(self, state: AgentState, runtime: Runtime) -> dict | None:
         return self._apply(state, runtime)
 
-    # aafter_model 钩子方法：异步版本
+    # aafter_model：异步版本的模型调用后钩子
     #
-    # 在模型执行后被调用，检查循环
+    # 方法作用：
+    #   与 after_model 相同，但用于异步调用。
+    #
+    # 参数：
+    #   state: AgentState，当前 agent 状态
+    #   runtime: Runtime，LangGraph 运行时上下文
+    #
+    # 返回值：
+    #   dict | None：状态更新字典
     @override
     async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict | None:
         return self._apply(state, runtime)
 
-    # reset 方法：清除跟踪状态
+    # ============================================================
+    # 公共方法
+    # ============================================================
+
+    # reset：清除跟踪状态
+    #
+    # 方法作用：
+    #   清除循环检测的跟踪状态。
     #
     # 参数：
-    #   thread_id: 如果提供，只清除该线程的跟踪；否则清除所有
+    #   thread_id: str | None，如果提供，只清除该线程的跟踪；否则清除所有
     def reset(self, thread_id: str | None = None) -> None:
         """Clear tracking state. If thread_id given, clear only that thread."""
         with self._lock:
