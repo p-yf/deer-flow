@@ -1,4 +1,25 @@
-"""Bash command execution subagent configuration."""
+"""Bash 命令执行子智能体配置。
+
+功能概述：
+  定义专门用于执行 bash 命令的子智能体配置。
+
+适用场景：
+  - 需要运行一系列相关 bash 命令
+  - git、npm、docker 等终端操作
+  - 命令输出冗长会扰乱主上下文时
+  - 构建、测试或部署操作
+
+不适用场景：
+  - 简单的单命令（直接使用 bash 工具）
+  - 需要复杂推理的任务（使用 general-purpose）
+
+设计考虑：
+  - 只允许沙箱工具（bash, ls, read_file, write_file, str_replace）
+  - 禁用 task（防止嵌套）等其他工具
+  - 最大轮次 60（命令执行通常较快）
+  - 使用 inherit 模型（与父级相同）
+  - 仅在主机 bash 允许时可用（由 registry.py 过滤）
+"""
 
 from deerflow.subagents.config import SubagentConfig
 
@@ -43,8 +64,13 @@ You have access to the sandbox environment:
 - Prefer relative paths from the workspace, such as `hello.txt`, `../uploads/input.csv`, and `../outputs/result.md`, when composing commands or helper scripts
 </working_directory>
 """,
-    tools=["bash", "ls", "read_file", "write_file", "str_replace"],  # Sandbox tools only
+    # 只允许沙箱工具：bash（执行命令）、ls（目录列表）、read_file、write_file、str_replace（文件操作）
+    # 这些是执行命令和文件操作所需的最小工具集
+    tools=["bash", "ls", "read_file", "write_file", "str_replace"],
+    # 禁用 task（防止嵌套）等其他工具
     disallowed_tools=["task", "ask_clarification", "present_files"],
+    # 使用与父级相同的模型
     model="inherit",
+    # 命令执行通常较快，60 轮足够
     max_turns=60,
 )

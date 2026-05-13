@@ -1,4 +1,24 @@
-"""General-purpose subagent configuration."""
+"""通用目的子智能体配置。
+
+功能概述：
+  定义适用于复杂多步骤任务的通用子智能体配置。
+
+适用场景：
+  - 需要探索和修改的任务
+  - 需要复杂推理来解释结果的任务
+  - 多个依赖步骤必须执行的任务
+  - 需要隔离上下文管理的任务
+
+不适用场景：
+  - 简单的单步操作
+  - 可以直接使用工具完成的任务
+
+设计考虑：
+  - 继承父级所有工具（tools=None）
+  - 禁用 task（防止嵌套）、ask_clarification（不需要澄清）、present_files（不需要呈现）
+  - 最大轮次 100（复杂任务需要更多交互）
+  - 使用 inherit 模型（与父级相同）
+"""
 
 from deerflow.subagents.config import SubagentConfig
 
@@ -43,8 +63,14 @@ You have access to the same sandbox environment as the parent agent:
 - Prefer relative paths from the workspace, such as `hello.txt`, `../uploads/input.csv`, and `../outputs/result.md`, when writing scripts or shell commands
 </working_directory>
 """,
-    tools=None,  # Inherit all tools from parent
-    disallowed_tools=["task", "ask_clarification", "present_files"],  # Prevent nesting and clarification
+    # tools=None 表示继承父级所有工具
+    # 子智能体可以使用与父级相同的完整工具集
+    tools=None,
+    # 禁用 task（防止嵌套）、ask_clarification（不需要澄清）、present_files（不需要呈现）
+    # 这些工具在子智能体上下文中没有意义或会导致问题
+    disallowed_tools=["task", "ask_clarification", "present_files"],
+    # 使用与父级相同的模型
     model="inherit",
+    # 复杂任务允许更多轮次
     max_turns=100,
 )
