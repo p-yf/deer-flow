@@ -1,3 +1,39 @@
+"""沙箱工具模块 - 提供所有沙箱操作的工具函数。
+
+本模块实现沙箱相关的 LangChain 工具，用于 agent 执行：
+1. bash：执行 bash 命令
+2. ls：列出目录内容
+3. glob：查找匹配 glob 模式的文件
+4. grep：在文件中搜索匹配模式
+5. read_file：读取文件内容
+6. write_file：写入文件内容
+7. str_replace：替换文件中的字符串
+
+核心概念：
+  - 虚拟路径系统：
+    * /mnt/user-data/workspace - 工作区文件
+    * /mnt/user-data/uploads - 上传的文件
+    * /mnt/user-data/outputs - 输出文件
+    * /mnt/skills - 技能目录（只读）
+    * /mnt/acp-workspace - ACP 工作区（只读）
+  - 路径转换：
+    * replace_virtual_path() - 虚拟路径转实际路径
+    * mask_local_paths_in_output() - 输出中隐藏主机路径
+  - 线程隔离：每个线程有独立的沙箱和工作目录
+  - 文件锁：并发写入保护
+
+安全考虑：
+  - 路径遍历检测：防止 .. 路径穿越
+  - 只读路径保护：技能目录和 ACP 工作区禁止写入
+  - MCP 文件系统路径白名单：仅允许配置的路径
+  - 本地 bash 命令验证：LocalSandbox 下限制绝对路径
+  - 输出截断：防止过大的输出
+
+工具与沙箱类型：
+  - LocalSandbox：路径转换在 tools.py 中处理
+  - AioSandbox：容器已挂载 /mnt/user-data，无需转换
+"""
+
 import posixpath
 import re
 import shlex
@@ -760,21 +796,27 @@ def _apply_cwd_prefix(command: str, thread_data: ThreadDataState | None) -> str:
     return command
 
 
+# 定义函数 get_thread_data，从运行时状态提取线程数据
 def get_thread_data(runtime: ToolRuntime[ContextT, ThreadState] | None) -> ThreadDataState | None:
     """Extract thread_data from runtime state."""
+    # 如果运行时或状态为空，返回None
     if runtime is None:
         return None
     if runtime.state is None:
         return None
+    # 从状态中获取thread_data并返回
     return runtime.state.get("thread_data")
 
 
+# 定义函数 is_local_sandbox，判断当前沙箱是否为本地沙箱
+# 本地沙箱需要路径转换（虚拟路径→实际路径），Aio沙箱已挂载/mnt不需要转换
 def is_local_sandbox(runtime: ToolRuntime[ContextT, ThreadState] | None) -> bool:
     """Check if the current sandbox is a local sandbox.
 
     Path replacement is only needed for local sandbox since aio sandbox
     already has /mnt/user-data mounted in the container.
     """
+    # 如果运行时、状态或沙箱状态为空，返回False
     if runtime is None:
         return False
     if runtime.state is None:
@@ -782,9 +824,11 @@ def is_local_sandbox(runtime: ToolRuntime[ContextT, ThreadState] | None) -> bool
     sandbox_state = runtime.state.get("sandbox")
     if sandbox_state is None:
         return False
+    # 判断沙箱ID是否为"local"
     return sandbox_state.get("sandbox_id") == "local"
 
 
+# 已弃用：请使用 ensure_sandbox_initialized 代替
 def sandbox_from_runtime(runtime: ToolRuntime[ContextT, ThreadState] | None = None) -> Sandbox:
     """Extract sandbox instance from tool runtime.
 
@@ -986,8 +1030,12 @@ def _truncate_ls_output(output: str, max_chars: int) -> str:
     return f"{output[:kept]}{marker}"
 
 
+# 使用 @tool 装饰器注册 bash 工具，parse_docstring=True 表示自动从文档字符串解析参数
 @tool("bash", parse_docstring=True)
+# 定义 bash_tool 函数，参数：运行时上下文、描述（命令用途说明）、要执行的bash命令
+# 返回值：命令执行结果的字符串
 def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, command: str) -> str:
+    # 工具的文档字符串，给 agent 使用说明
     """Execute a bash command in a Linux environment.
 
 
@@ -999,38 +1047,63 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
         description: Explain why you are running this command in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         command: The bash command to execute. Always use absolute paths for files and directories.
     """
+    # 开始异常处理，捕获沙箱执行过程中的所有错误
     try:
+        # 调用 ensure_sandbox_initialized 获取沙箱实例（懒加载）
+        # 如果还没有沙箱，会从 provider 获取一个（本地或Aio）
         sandbox = ensure_sandbox_initialized(runtime)
+
+        # 判断当前是否为本地沙箱（本地沙箱需要路径转换，Aio容器已挂载/mnt不需要）
         if is_local_sandbox(runtime):
+            # 本地沙箱模式：先检查是否允许本地bash（配置项 sandbox.allow_host_bash）
             if not is_host_bash_allowed():
+                # 不允许本地bash，返回错误消息
                 return f"Error: {LOCAL_HOST_BASH_DISABLED_MESSAGE}"
+            # 确保线程目录（workspace/uploads/outputs）已创建
             ensure_thread_directories_exist(runtime)
+            # 从运行时状态获取线程数据（包含workspace_path等）
             thread_data = get_thread_data(runtime)
+            # 验证bash命令中的绝对路径是否安全（检查MCP允许路径、虚拟路径、系统路径白名单）
             validate_local_bash_command_paths(command, thread_data)
+            # 将命令中的虚拟路径替换为实际主机路径
+            # 例如 /mnt/user-data/workspace/file.txt → D:/.../threads/xxx/user-data/workspace/file.txt
             command = replace_virtual_paths_in_command(command, thread_data)
+            # 添加 cd 到工作区的前缀，使相对路径解析到线程工作区
+            # 例如 command = "python test.py" → "cd /path/to/workspace && python test.py"
             command = _apply_cwd_prefix(command, thread_data)
+            # 在沙箱中执行转换后的命令
             output = sandbox.execute_command(command)
+            # 获取配置中的输出最大字符数限制
             try:
                 from deerflow.config.app_config import get_app_config
-
                 sandbox_cfg = get_app_config().sandbox
+                # 从配置读取限制，如果配置为空则使用默认值20000
                 max_chars = sandbox_cfg.bash_output_max_chars if sandbox_cfg else 20000
             except Exception:
+                # 配置读取失败，使用默认值
                 max_chars = 20000
+            # 对输出进行脱敏（将主机路径替换回虚拟路径），然后截断到max_chars，返回
             return _truncate_bash_output(mask_local_paths_in_output(output, thread_data), max_chars)
+
+        # Aio沙箱模式（else分支）：容器已挂载/mnt，不需要路径转换
+        # 确保线程目录存在（虽然在Aio模式下容器已挂载，但本地目录可能也需要）
         ensure_thread_directories_exist(runtime)
         try:
             from deerflow.config.app_config import get_app_config
-
             sandbox_cfg = get_app_config().sandbox
             max_chars = sandbox_cfg.bash_output_max_chars if sandbox_cfg else 20000
         except Exception:
             max_chars = 20000
+        # 直接执行命令并截断返回（Aio容器已挂载/mnt，无需路径转换和脱敏）
         return _truncate_bash_output(sandbox.execute_command(command), max_chars)
+
+    # 捕获沙箱相关错误（沙箱未找到、运行时错误等）
     except SandboxError as e:
         return f"Error: {e}"
+    # 捕获权限错误（路径验证失败、文件访问被拒绝等）
     except PermissionError as e:
         return f"Error: {e}"
+    # 捕获其他所有异常，并对错误信息进行脱敏（隐藏主机路径）
     except Exception as e:
         return f"Error: Unexpected error executing command: {_sanitize_error(e, runtime)}"
 

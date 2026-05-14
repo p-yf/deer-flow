@@ -1,18 +1,19 @@
-"""Remote sandbox backend — delegates Pod lifecycle to the provisioner service.
+"""远程沙箱后端模块 - 通过 provisioner 服务管理远程沙箱生命周期。
 
-The provisioner dynamically creates per-sandbox-id Pods + NodePort Services
-in k3s.  The backend accesses sandbox pods directly via ``k3s:{NodePort}``.
+本模块实现 RemoteSandboxBackend 类，通过 HTTP API 与 provisioner 服务通信，
+由 provisioner 在 k3s 集群中动态创建/销毁沙箱 Pod 和 Service。
 
-Architecture:
-    ┌────────────┐  HTTP   ┌─────────────┐  K8s API  ┌──────────┐
-    │ this file  │ ──────▸ │ provisioner │ ────────▸ │   k3s    │
-    │ (backend)  │         │ :8002       │           │ :6443    │
-    └────────────┘         └─────────────┘           └─────┬────┘
-                                                           │ creates
-                           ┌─────────────┐           ┌─────▼──────┐
-                           │   backend   │ ────────▸ │  sandbox   │
-                           │             │  direct   │  Pod(s)    │
-                           └─────────────┘ k3s:NPort └────────────┘
+架构说明：
+  - provisioner 在 k3s 中为每个 sandbox_id 创建 Pod + NodePort Service
+  - 后端直接通过 k3s:{NodePort} 访问沙箱 Pod
+
+使用场景：
+  - config.yaml 中配置 provisioner_url
+  - 例如：sandbox.provisioner_url: http://provisioner:8002
+
+限制：
+  - 沙箱发现需要 provisioner 运行并可访问
+  - destroy 是幂等的（404 被视为成功）
 """
 
 from __future__ import annotations

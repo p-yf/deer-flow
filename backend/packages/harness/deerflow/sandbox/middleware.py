@@ -22,7 +22,6 @@
 
 执行位置：中间件链第三位（紧接 UploadsMiddleware 之后）。
 """
-"""Middleware for sandbox lifecycle management."""
 
 # ============================================================
 # 导入标准库
@@ -83,6 +82,7 @@ logger = logging.getLogger(__name__)
 #
 # 作用说明：
 #   继承自 AgentState，作为 SandboxMiddleware 的状态类型。
+#   定义了中间件需要访问和修改的状态字段。
 class SandboxMiddlewareState(AgentState):
     # sandbox 字段：沙箱状态信息
     # 类型是 SandboxState | None，表示可选字段
@@ -138,6 +138,7 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
     def __init__(self, lazy_init: bool = True):
         # 调用父类 AgentMiddleware 的构造函数
         super().__init__()
+
         # 保存 lazy_init 配置
         self._lazy_init = lazy_init
 
@@ -168,10 +169,13 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
     def _acquire_sandbox(self, thread_id: str) -> str:
         # 获取全局的 SandboxProvider 实例
         provider = get_sandbox_provider()
+
         # 调用 provider 的 acquire 方法，传入 thread_id
         sandbox_id = provider.acquire(thread_id)
+
         # 记录日志：获取了哪个沙箱
         logger.info(f"Acquiring sandbox {sandbox_id}")
+
         # 返回沙箱 ID
         return sandbox_id
 
@@ -215,8 +219,10 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
 
             # 调用内部方法获取沙箱
             sandbox_id = self._acquire_sandbox(thread_id)
+
             # 记录日志：沙箱分配给哪个线程
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
+
             # 返回状态更新，包含 sandbox 信息
             return {"sandbox": {"sandbox_id": sandbox_id}}
 
@@ -252,8 +258,10 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         if sandbox is not None:
             # 从 sandbox 字典中获取 sandbox_id
             sandbox_id = sandbox["sandbox_id"]
+
             # 记录日志：释放沙箱
             logger.info(f"Releasing sandbox {sandbox_id}")
+
             # 调用 provider.release() 释放沙箱
             get_sandbox_provider().release(sandbox_id)
             return None
