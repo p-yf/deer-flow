@@ -55,9 +55,26 @@ from deerflow.uploads.manager import (
 logger = logging.getLogger(__name__)
 
 
+# StreamEventType：流事件的类型字面量
+# 定义了三种流模式 + 结束事件
+# - values：完整状态快照（title, messages, artifacts）
+# - messages-tuple：每条消息的增量更新（AI 文本增量、tool calls、tool results）
+# - custom：自定义事件（来自 StreamWriter）
+# - end：流结束
 StreamEventType = Literal["values", "messages-tuple", "custom", "end"]
 
 
+# StreamEvent：流事件的数据类
+#
+# 属性：
+#   type: StreamEventType，事件类型
+#   data: dict[str, Any]，事件负载，内容因类型而异
+#
+# 设计说明：
+#   - 对齐 LangGraph SSE 协议
+#   - messages-tuple 的 AI 文本是增量（delta），消费者需要按 id 累积
+#   - values 包含完整状态快照，用于获取 title 和 artifacts
+#   - end 携带累积的 usage 信息
 @dataclass
 class StreamEvent:
     """A single event from the streaming agent response.
@@ -72,7 +89,13 @@ class StreamEvent:
         data: Event payload. Contents vary by type.
     """
 
+    # 事件类型：values / messages-tuple / custom / end
     type: StreamEventType
+    # 事件负载字典，内容因 type 不同而不同
+    # - values: {"title": str|None, "messages": [...], "artifacts": [...]}
+    # - messages-tuple: {"type": "ai"|"tool", "content": str, "id": str, ...}
+    # - custom: 来自 StreamWriter 的原始数据
+    # - end: {"usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int}}
     data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -555,16 +578,33 @@ class DeerFlowClient:
         if self._agent_name:
             context["agent_name"] = self._agent_name
 
+        # seen_ids：已处理的消息 ID 集合，用于 values 模式去重
+        # 防止同一条消息在 values 快照中被重复处理
         seen_ids: set[str] = set()
-        # Cross-mode handoff: ids already streamed via LangGraph ``messages``
-        # mode so the ``values`` path skips re-synthesis of the same message.
+        # streamed_ids：通过 messages 模式已发送的消息 ID 集合
+        # 用于让 values 路径知道哪些消息已经在 messages 中发送过
+        # 跨模式交接：ids 已经通过 LangGraph messages 模式发送
         streamed_ids: set[str] = set()
-        # The same message id carries identical cumulative ``usage_metadata``
-        # in both the final ``messages`` chunk and the values snapshot —
-        # count it only on whichever arrives first.
+        # counted_usage_ids：已统计过 usage 的消息 ID 集合
+        # 同一个消息 id 在 final messages chunk 和 values 快照中携带相同的 usage_metadata
+        # 只在最先到达的那个事件中统计，避免重复计数
         counted_usage_ids: set[str] = set()
+        # 累积 usage 统计
         cumulative_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+        # _account_usage：统计消息的 usage 到累积计数器
+        #
+        # 参数：
+        #   msg_id: str | None，消息 ID
+        #   usage: Any，UsageMetadata TypedDict 或 None
+        #
+        # 返回值：
+        #   dict | None，如果接受统计则返回规范化的 usage 字典，否则 None
+        #
+        # 设计说明：
+        #   - 检查 msg_id 是否已统计过（幂等性）
+        #   - 将 input/output/total_tokens 累加到 cumulative_usage
+        #   - 返回的字典用于附加到事件上
         def _account_usage(msg_id: str | None, usage: Any) -> dict | None:
             """Add *usage* to cumulative totals if this id has not been counted.
 
@@ -574,100 +614,129 @@ class DeerFlowClient:
             checking.  Returns the normalized usage dict (for attaching
             to an event) when we accepted it, otherwise ``None``.
             """
+            # 无 usage 或无 msg_id，无需处理
             if not usage:
                 return None
+            # 已统计过，跳过
             if msg_id and msg_id in counted_usage_ids:
                 return None
+            # 标记为已统计
             if msg_id:
                 counted_usage_ids.add(msg_id)
+            # 提取 token 计数（使用 or 0 处理可能的 None 值）
             input_tokens = usage.get("input_tokens", 0) or 0
             output_tokens = usage.get("output_tokens", 0) or 0
             total_tokens = usage.get("total_tokens", 0) or 0
+            # 累加到累积计数器
             cumulative_usage["input_tokens"] += input_tokens
             cumulative_usage["output_tokens"] += output_tokens
             cumulative_usage["total_tokens"] += total_tokens
+            # 返回规范化的 usage 字典（用于附加到事件）
             return {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
             }
 
+        # stream() 主循环：订阅 LangGraph 的三种 stream_mode
+        # - values：节点级别的完整状态快照
+        # - messages：LLM 输出的 token 增量
+        # - custom：StreamWriter 的自定义事件
         for item in self._agent.stream(
             state,
             config=config,
             context=context,
             stream_mode=["values", "messages", "custom"],
         ):
+            # 解析 mode 和 chunk
+            # item 可能是 (mode, chunk) 元组或直接是 chunk
             if isinstance(item, tuple) and len(item) == 2:
                 mode, chunk = item
                 mode = str(mode)
             else:
                 mode, chunk = "values", item
 
+            # custom 模式：直接转发 StreamWriter 事件
             if mode == "custom":
                 yield StreamEvent(type="custom", data=chunk)
                 continue
 
+            # messages 模式：处理 LLM token 增量
             if mode == "messages":
-                # LangGraph ``messages`` mode emits ``(message_chunk, metadata)``.
+                # LangGraph messages 模式发出 (message_chunk, metadata) 元组
                 if isinstance(chunk, tuple) and len(chunk) == 2:
                     msg_chunk, _metadata = chunk
                 else:
                     msg_chunk = chunk
 
+                # 获取消息 ID
                 msg_id = getattr(msg_chunk, "id", None)
 
+                # AIMessage：AI 文本增量或 tool calls
                 if isinstance(msg_chunk, AIMessage):
+                    # 提取文本内容
                     text = self._extract_text(msg_chunk.content)
+                    # 统计 usage
                     counted_usage = _account_usage(msg_id, msg_chunk.usage_metadata)
 
+                    # 有文本内容，yield AI 文本增量事件
                     if text:
+                        # 记录已发送的消息 ID（用于 values 去重）
                         if msg_id:
                             streamed_ids.add(msg_id)
                         yield self._ai_text_event(msg_id, text, counted_usage)
 
+                    # 有 tool calls，yield tool calls 事件
                     if msg_chunk.tool_calls:
                         if msg_id:
                             streamed_ids.add(msg_id)
                         yield self._ai_tool_calls_event(msg_id, msg_chunk.tool_calls)
 
+                # ToolMessage：tool 执行结果
                 elif isinstance(msg_chunk, ToolMessage):
                     if msg_id:
                         streamed_ids.add(msg_id)
                     yield self._tool_message_event(msg_chunk)
                 continue
 
-            # mode == "values"
+            # values 模式：处理完整状态快照
+            # 注意：AI 文本已经在 messages 模式中发送，这里不会重新发送
+            # 只会处理不在 streamed_ids 中的消息（defensive 捕获 usage）
             messages = chunk.get("messages", [])
 
             for msg in messages:
                 msg_id = getattr(msg, "id", None)
+                # 已见过该消息，跳过
                 if msg_id and msg_id in seen_ids:
                     continue
                 if msg_id:
                     seen_ids.add(msg_id)
 
-                # Already streamed via ``messages`` mode; only (defensively)
-                # capture usage here and skip re-synthesizing the event.
+                # 已在 messages 模式中发送过，跳过内容但捕获 usage
                 if msg_id and msg_id in streamed_ids:
                     if isinstance(msg, AIMessage):
                         _account_usage(msg_id, getattr(msg, "usage_metadata", None))
                     continue
 
+                # 处理 AIMessage
                 if isinstance(msg, AIMessage):
+                    # 统计 usage
                     counted_usage = _account_usage(msg_id, msg.usage_metadata)
 
+                    # Tool calls（一般不会到这里，因为 messages 模式已处理）
                     if msg.tool_calls:
                         yield self._ai_tool_calls_event(msg_id, msg.tool_calls)
 
+                    # 文本内容
                     text = self._extract_text(msg.content)
                     if text:
                         yield self._ai_text_event(msg_id, text, counted_usage)
 
+                # 处理 ToolMessage（一般不会到这里，因为 messages 模式已处理）
                 elif isinstance(msg, ToolMessage):
                     yield self._tool_message_event(msg)
 
-            # Emit a values event for each state snapshot
+            # 为每个状态快照 yield values 事件
             yield StreamEvent(
                 type="values",
                 data={
@@ -677,6 +746,7 @@ class DeerFlowClient:
                 },
             )
 
+        # 流结束，yield end 事件（携带累积 usage）
         yield StreamEvent(type="end", data={"usage": cumulative_usage})
 
     def chat(self, message: str, *, thread_id: str | None = None, **kwargs) -> str:
